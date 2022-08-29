@@ -20,7 +20,7 @@ from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 
-from k_diffusion.sampling import sample_lms, sample_dpm_2, sample_dpm_2_ancestral, sample_euler, sample_euler_ancestral, sample_heun, get_sigmas_karras
+from k_diffusion.sampling import sample_lms, sample_dpm_2, sample_dpm_2_ancestral, sample_euler, sample_euler_ancestral, sample_heun, get_sigmas_karras, make_dynamic_thresholder
 from k_diffusion.external import CompVisDenoiser
 
 def get_device():
@@ -191,6 +191,7 @@ def main():
         "--dynamic_thresholding_percentile",
         type=float,
         default=0.9,
+        help="implements dynamic thresholding from Imagen paper, section E Figure A.32. pushes saturated pixels (those near -1 and 1) inwards at every step, preventing saturation"
     )
     parser.add_argument(
         "--laion400m",
@@ -415,6 +416,8 @@ def main():
                                     sigmas = model_k_wrapped.sigmas[torch.argmin((sigmas.reshape(len(sigmas), 1).repeat(1, len(model_k_wrapped.sigmas)) - model_k_wrapped.sigmas).abs(), dim=1)]
                             else:
                                 sigmas = model_k_wrapped.get_sigmas(opt.steps)
+                            
+                            postprocess_step = make_dynamic_thresholder(opt.dynamic_thresholding_percentile) if opt.dynamic_thresholding else None
 
                             x = start_code * sigmas[0] # for GPU draw
                             extra_args = {
@@ -427,22 +430,10 @@ def main():
                                 x,
                                 sigmas,
                                 extra_args=extra_args,
+                                postprocess_step=postprocess_step,
                                 **noise_schedule_sampler_args)
 
                         x_samples = model.decode_first_stage(samples)
-
-                        if opt.dynamic_thresholding:
-                            # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
-                            # adapted from lucidrains' imagen_pytorch (MIT-licensed)
-                            # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
-                            s = torch.quantile(
-                                rearrange(x_samples, 'a b ... -> a b (...)').abs(),
-                                opt.dynamic_thresholding_percentile,
-                                dim = 2
-                            )
-                            s.clamp_(min = 1.)
-                            s = right_pad_dims_to(x_samples, s)
-                            x_samples = x_samples.clamp(-s, s) / s
                         
                         x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
                         x_samples = x_samples.cpu().permute(0, 2, 3, 1).numpy()
