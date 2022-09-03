@@ -472,13 +472,17 @@ def main():
         sample_ix=f".n{batch_ix}.i{sample_ix_in_batch}"
         common_file_name_portion = _compute_common_file_name_portion(sample_ix=sample_ix, sigmas=sigmas)
         return f"{base_count:05}{common_file_name_portion}.png"
+    
+    def img_to_latent(path: str) -> Tensor:
+        assert os.path.isfile(path)
+        image = load_img(path).to(device)
+        image = repeat(image, '1 ... -> b ...', b=batch_size)
+        latent: Tensor = model.get_first_stage_encoding(model.encode_first_stage(image))  # move to latent space
+        return latent
 
     init_latent = None
     if opt.init_img:
-        assert os.path.isfile(opt.init_img)
-        init_image = load_img(opt.init_img).to(device)
-        init_image = repeat(init_image, '1 ... -> b ...', b=batch_size)
-        init_latent = model.get_first_stage_encoding(model.encode_first_stage(init_image))  # move to latent space
+        init_latent = img_to_latent(opt.init_img)
     t_enc = int((1.0-opt.strength) * opt.steps)
 
     precision_scope = autocast if opt.precision=="autocast" else nullcontext
