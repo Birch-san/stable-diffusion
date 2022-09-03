@@ -223,14 +223,14 @@ def main():
         action='store_true',
         help=f"if you are using a non-Karras k-diffusion sampler, {NON_KARRAS_K_DIFF_SAMPLERS}, and you're feeling spicy: rounds your noise schedule to the DDIM's nearest sigma before we give it to the sampler. this might be a crazy thing to do, or it might actually help.",
     )
-    parser.add_argument(
-        "--dynamic_thresholding",
-        action='store_true',
-    )
+    # parser.add_argument(
+    #     "--dynamic_thresholding",
+    #     action='store_true',
+    # )
     parser.add_argument(
         "--dynamic_thresholding_percentile",
         type=float,
-        default=0.9995,
+        default=None,
     )
     parser.add_argument(
         "--laion400m",
@@ -521,8 +521,11 @@ def main():
                                     unconditional_guidance_scale=opt.scale,
                                     unconditional_conditioning=uc,
                                     eta=opt.ddim_eta,
-                                    x_T=start_code
+                                    x_T=start_code,
+                                    dynamic_threshold_pct=opt.dynamic_thresholding_percentile
                                 )
+                                # TODO
+                                sigmas_pretty = ''
                             else:
                                 z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
                                 samples = sampler.decode(
@@ -651,33 +654,33 @@ def main():
 
                         x_samples = model.decode_first_stage(samples)
 
-                        if opt.dynamic_thresholding:
-                            # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
-                            # adapted from lucidrains' imagen_pytorch (MIT-licensed)
-                            flattened = rearrange(x_samples, 'a b ... -> a b (...)').abs()
-                            # aten::sort.values_stable not implemented for MPS
-                            sort_on_cpu = device.type == 'mps'
-                            flattened = flattened.cpu() if sort_on_cpu else flattened
-                            # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
-                            s = torch.quantile(
-                                flattened,
-                                opt.dynamic_thresholding_percentile,
-                                dim = 2
-                            )
-                            s = s.to(device) if sort_on_cpu else s
-                            s.clamp_(min = 1.)
-                            s = right_pad_dims_to(x_samples, s)
-                            # MPS complains min and input tensors must be of the same shape
+                        # if opt.dynamic_thresholding:
+                        #     # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
+                        #     # adapted from lucidrains' imagen_pytorch (MIT-licensed)
+                        #     flattened = rearrange(x_samples, 'a b ... -> a b (...)').abs()
+                        #     # aten::sort.values_stable not implemented for MPS
+                        #     sort_on_cpu = device.type == 'mps'
+                        #     flattened = flattened.cpu() if sort_on_cpu else flattened
+                        #     # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
+                        #     s = torch.quantile(
+                        #         flattened,
+                        #         opt.dynamic_thresholding_percentile,
+                        #         dim = 2
+                        #     )
+                        #     s = s.to(device) if sort_on_cpu else s
+                        #     s.clamp_(min = 1.)
+                        #     s = right_pad_dims_to(x_samples, s)
+                        #     # MPS complains min and input tensors must be of the same shape
 
-                            clamp_tensors_on_cpu = device.type == 'mps'
-                            s_orig = s
-                            neg_s = -s
-                            s = s.cpu() if clamp_tensors_on_cpu else s
-                            neg_s = neg_s.cpu() if clamp_tensors_on_cpu else neg_s
-                            x_samples = x_samples.cpu() if clamp_tensors_on_cpu else x_samples
-                            x_samples = x_samples.clamp(neg_s, s)
-                            x_samples = x_samples.to(device) if clamp_tensors_on_cpu else x_samples
-                            x_samples = x_samples / s_orig
+                        #     clamp_tensors_on_cpu = device.type == 'mps'
+                        #     s_orig = s
+                        #     neg_s = -s
+                        #     s = s.cpu() if clamp_tensors_on_cpu else s
+                        #     neg_s = neg_s.cpu() if clamp_tensors_on_cpu else neg_s
+                        #     x_samples = x_samples.cpu() if clamp_tensors_on_cpu else x_samples
+                        #     x_samples = x_samples.clamp(neg_s, s)
+                        #     x_samples = x_samples.to(device) if clamp_tensors_on_cpu else x_samples
+                        #     x_samples = x_samples / s_orig
                         
                         x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
                         x_samples = x_samples.cpu().permute(0, 2, 3, 1).numpy()

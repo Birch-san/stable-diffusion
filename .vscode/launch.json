@@ -87,9 +87,9 @@
         "1396704121",
         "--scale",
         "20",
-        "--dynamic_thresholding",
+        // "--dynamic_thresholding",
         "--dynamic_thresholding_percentile",
-        "0.9"
+        "99.5"
         // "--fixed_code",
         "--init_img",
         "/Users/birch/dall-e-mega/fumo plush of lina from dota 1.jpg",
