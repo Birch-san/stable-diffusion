@@ -17,6 +17,7 @@ from contextlib import contextmanager, nullcontext
 from random import randint
 from typing import Optional
 import re
+from ldm.models.diffusion.ddpm import LatentDiffusion
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -41,11 +42,12 @@ NOT_K_DIFF_SAMPLERS = { 'ddim', 'plms' }
 VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
 
 class KCFGDenoiser(nn.Module):
-    def __init__(self, model):
+    inner_model: CompVisDenoiser
+    def __init__(self, model: CompVisDenoiser):
         super().__init__()
         self.inner_model = model
 
-    def forward(self, x, sigma, uncond, cond, cond_scale):
+    def forward(self, x: Tensor, sigma: Tensor, uncond: Tensor, cond: Tensor, cond_scale: float) -> Tensor:
         x_in = torch.cat([x] * 2)
         sigma_in = torch.cat([sigma] * 2)
         cond_in = torch.cat([uncond, cond])
@@ -371,14 +373,14 @@ def main():
     seed_everything(opt.seed)
 
     config = OmegaConf.load(f"{opt.config}")
-    model = load_model_from_config(config, f"{opt.ckpt}")
+    model: LatentDiffusion = load_model_from_config(config, f"{opt.ckpt}")
 
     device = torch.device(get_device())
     model = model.to(device)
 
     if opt.sampler in K_DIFF_SAMPLERS:
         model_k_wrapped = CompVisDenoiser(model, quantize=True)
-        model_k_config = KCFGDenoiser(model_k_wrapped)
+        model_k_guidance = KCFGDenoiser(model_k_wrapped)
     elif opt.sampler in NOT_K_DIFF_SAMPLERS:
         if opt.sampler == 'plms':
             sampler = PLMSSampler(model)
@@ -615,7 +617,7 @@ def main():
                                 'cond_scale': opt.scale,
                             }
                             samples = sampling_fn(
-                                model_k_config,
+                                model_k_guidance,
                                 x,
                                 sigmas,
                                 extra_args=extra_args,
