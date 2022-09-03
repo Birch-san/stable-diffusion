@@ -15,7 +15,7 @@ from pytorch_lightning import seed_everything
 from torch import autocast, nn
 from contextlib import contextmanager, nullcontext
 from random import randint
-from typing import Optional
+from typing import Optional, Iterable
 import re
 from ldm.models.diffusion.ddpm import LatentDiffusion
 
@@ -47,11 +47,13 @@ class KCFGDenoiser(nn.Module):
         super().__init__()
         self.inner_model = model
 
-    def forward(self, x: Tensor, sigma: Tensor, uncond: Tensor, cond: Tensor, cond_scale: float) -> Tensor:
+    def forward(self, x: Tensor, sigma: Tensor, uncond: Tensor, conditions: Iterable[Tensor], cond_scale: float) -> Tensor:
         x_in = torch.cat([x] * 2)
         sigma_in = torch.cat([sigma] * 2)
-        cond_in = torch.cat([uncond, cond])
-        uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2)
+        cond_in = torch.cat([uncond, *conditions])
+        conditions_len = len(conditions)
+        uncond, *conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(1 + conditions_len)
+        cond = torch.sum(torch.stack(conditions), dim=0) / conditions_len
         return uncond + (cond - uncond) * cond_scale
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
@@ -616,7 +618,7 @@ def main():
                             if init_latent is not None:
                                 x = init_latent + x
                             extra_args = {
-                                'cond': c,
+                                'conditions': (c,),
                                 'uncond': uc,
                                 'cond_scale': opt.scale,
                             }
