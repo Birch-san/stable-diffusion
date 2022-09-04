@@ -1,5 +1,5 @@
 import torch
-from torch import Tensor, FloatTensor
+from torch import FloatTensor
 import torch.nn as nn
 from functools import partial
 import clip
