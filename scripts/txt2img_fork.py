@@ -60,7 +60,7 @@ class KCFGDenoiser(nn.Module):
         uncond, cond, *img_conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(chunks)
 
         img_cond = (torch.sum(torch.stack(img_conditions), dim=0) / len(img_conditions)) if img_conditions else torch.zeros_like(uncond, device=uncond.device)
-        return uncond + (cond + img_cond - uncond) * cond_scale
+        return uncond + ((cond + img_cond)/2 - uncond) * cond_scale
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
