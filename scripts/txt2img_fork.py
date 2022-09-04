@@ -2,7 +2,6 @@ import argparse, os, sys, glob
 import cv2
 import torch
 import numpy as np
-from numpy.typing import _ArrayLikeFloat_co
 from torch import Tensor, FloatTensor
 from omegaconf import OmegaConf
 from PIL import Image
@@ -22,6 +21,7 @@ import re
 from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.modules.encoders.modules import FrozenCLIPEmbedder
 from transformers.feature_extraction_utils import BatchFeature
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -51,13 +51,14 @@ class KCFGDenoiser(nn.Module):
         super().__init__()
         self.inner_model = model
 
-    def forward(self, x: Tensor, sigma: Tensor, uncond: Tensor, conditions: Iterable[Tensor], cond_scale: float) -> Tensor:
+    def forward(self, x: Tensor, sigma: Tensor, uncond: Tensor, cond: Tensor, img_conditions: Iterable[Tensor], cond_scale: float) -> Tensor:
         x_in = torch.cat([x] * 2)
         sigma_in = torch.cat([sigma] * 2)
-        cond_in = torch.cat([uncond, *conditions])
-        conditions_len = len(conditions)
-        uncond, *conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(1 + conditions_len)
-        cond = torch.sum(torch.stack(conditions), dim=0) / conditions_len
+        img_conditions = [right_pad_dims_to(img_condition, uncond) for img_condition in img_conditions]
+        cond_in = torch.cat([uncond, cond, *img_conditions])
+        img_conditions_len = len(img_conditions)
+        uncond, cond, *img_conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2 + img_conditions_len)
+        cond = torch.sum(torch.stack(img_conditions), dim=0) / img_conditions_len
         return uncond + (cond - uncond) * cond_scale
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
@@ -504,20 +505,26 @@ def main():
         image: Image = Image.open(path)
         output: BatchFeature = clip_embedder.feature_extractor(
             images=image,
-            resample=Resampling.LANCZOS,
-            size=512,
-            do_resize=True,
-            convert_rgb=True,
-            # from FrozenClipImageEmbedder
-            image_mean=[0.48145466, 0.4578275, 0.40821073],
-            image_std=[0.26862954, 0.26130258, 0.27577711],
+            return_tensors="pt"
         )
-        batch_pixel_values: List[_ArrayLikeFloat_co] = output.data['pixel_values']
-        pixels: _ArrayLikeFloat_co = batch_pixel_values[0]
-        pixel_tensor: FloatTensor = torch.from_numpy(pixels)
-        encoding: FloatTensor = clip_embedder.encode_image(pixel_tensor).to(device)
-        return encoding
+        pixel_values: FloatTensor = output.pixel_values
+        pixel_values: FloatTensor = pixel_values.to(device)
+        outputs: BaseModelOutputWithPooling = clip_embedder.encode_image(pixel_values)
+        pooled_output: FloatTensor = outputs.pooler_output
+        image_embeds: FloatTensor = clip_embedder.visual_projection(pooled_output)
+        return image_embeds
     
+    # let's try again, but using the approach from https://github.com/rom1504/clip-retrieval
+    # gets the right dimensionality [1, 1, 768] but I'd prefer the huggingface approach (img_to_encoding),
+    # for consistent with how prompts are embedded.
+    def img_to_encoding2(path: str) -> Tensor:
+        assert os.path.isfile(path)
+        clip_embedder: FrozenCLIPEmbedder = model.cond_stage_model
+        image: Image = Image.open(path)
+        prepro = clip_embedder.preprocess(image).unsqueeze(0).to(device)
+        encoding: FloatTensor = clip_embedder.clip.encode_image(prepro)
+        return encoding
+
     cond_imgs: List[Tensor] = []
     if opt.cond_img:
         for img_path in opt.cond_img:
@@ -667,8 +674,9 @@ def main():
                             if init_latent is not None:
                                 x = init_latent + x
                             extra_args = {
+                                'cond': c,
                                 # TODO: do we need to repeat each cond_img batch_size times? we did it for uc, but not for c…
-                                'conditions': (c, *cond_imgs),
+                                'img_conditions': cond_imgs,
                                 'uncond': uc,
                                 'cond_scale': opt.scale,
                             }
