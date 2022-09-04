@@ -53,14 +53,15 @@ class KCFGDenoiser(nn.Module):
 
     def forward(self, x: Tensor, sigma: Tensor, uncond: Tensor, cond: Tensor, img_conditions: Iterable[Tensor], cond_scale: float) -> Tensor:
         img_conditions = [img_condition.unsqueeze(1).repeat(1, uncond.size(dim=1), 1) for img_condition in img_conditions]
-        chunks = 1 + len(img_conditions)
-        x_in = torch.cat([x] * chunks)
-        sigma_in = torch.cat([sigma] * chunks)
-        cond_in = torch.cat([uncond, *img_conditions])
-        uncond, *img_conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(chunks)
+        conditions = [uncond, cond, *img_conditions]
+        condition_count = len(conditions)
+        cond_in = torch.cat(conditions)
+        x_in = torch.cat([x] * condition_count)
+        sigma_in = torch.cat([sigma] * condition_count)
+        uncond, cond, *img_conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(condition_count)
 
         img_cond = (torch.sum(torch.stack(img_conditions), dim=0) / len(img_conditions)) if img_conditions else torch.zeros_like(uncond, device=uncond.device)
-        return uncond + (img_cond - uncond) * cond_scale
+        return uncond + ((cond + img_cond)/2 - uncond) * cond_scale
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
