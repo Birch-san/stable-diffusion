@@ -3,8 +3,6 @@ from torch import Tensor, FloatTensor
 import torch.nn as nn
 from functools import partial
 import clip
-from clip.model import CLIP
-from torchvision.transforms import Compose
 from einops import rearrange, repeat
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPVisionModel, CLIPFeatureExtractor
 from transformers.modeling_outputs import BaseModelOutputWithPooling
@@ -153,8 +151,6 @@ class FrozenCLIPEmbedder(AbstractEncoder):
     vision: CLIPVisionModel
     feature_extractor: CLIPFeatureExtractor
     visual_projection: nn.Linear
-    clip: CLIP
-    preprocess: Compose
     """Uses the CLIP transformer encoder for text (from Hugging Face)"""
     def __init__(self, version="openai/clip-vit-large-patch14", device=get_default_device_type(), max_length=77):
         super().__init__()
@@ -167,9 +163,6 @@ class FrozenCLIPEmbedder(AbstractEncoder):
         # out_features=self.vision.config.projection_dim
         # but there's no such property on openai/clip-vit-large-patch14.
         self.visual_projection = nn.Linear(self.vision.config.hidden_size, out_features=self.transformer.config.hidden_size, bias=False)
-        model, preprocess = clip.load("ViT-L/14", device=device, jit=torch.device(device).type != 'mps')
-        self.clip = model
-        self.preprocess = preprocess
         self.device = device
         self.max_length = max_length
         self.freeze()

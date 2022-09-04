@@ -513,17 +513,6 @@ def main():
         pooled_output: FloatTensor = outputs.pooler_output
         image_embeds: FloatTensor = clip_embedder.visual_projection(pooled_output)
         return image_embeds
-    
-    # let's try again, but using the approach from https://github.com/rom1504/clip-retrieval
-    # gets the right dimensionality [1, 1, 768] but I'd prefer the huggingface approach (img_to_encoding),
-    # for consistent with how prompts are embedded.
-    def img_to_encoding2(path: str) -> Tensor:
-        assert os.path.isfile(path)
-        clip_embedder: FrozenCLIPEmbedder = model.cond_stage_model
-        image: Image = Image.open(path)
-        prepro = clip_embedder.preprocess(image).unsqueeze(0).to(device)
-        encoding: FloatTensor = clip_embedder.clip.encode_image(prepro)
-        return encoding
 
     cond_imgs: List[Tensor] = []
     if opt.cond_img:
