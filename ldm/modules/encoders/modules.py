@@ -1,9 +1,11 @@
 import torch
+from torch import Tensor, FloatTensor
 import torch.nn as nn
 from functools import partial
 import clip
 from einops import rearrange, repeat
-from transformers import CLIPTokenizer, CLIPTextModel
+from transformers import CLIPTokenizer, CLIPTextModel, CLIPVisionModel, CLIPFeatureExtractor
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 import kornia
 
 from ldm.modules.x_transformer import Encoder, TransformerWrapper  # TODO: can we directly rely on lucidrains code and simply add this as a reuirement? --> test
@@ -144,11 +146,17 @@ class SpatialRescaler(nn.Module):
         return self(x)
 
 class FrozenCLIPEmbedder(AbstractEncoder):
+    tokenizer: CLIPTokenizer
+    transformer: CLIPTextModel
+    vision: CLIPVisionModel
+    feature_extractor: CLIPFeatureExtractor
     """Uses the CLIP transformer encoder for text (from Hugging Face)"""
     def __init__(self, version="openai/clip-vit-large-patch14", device=get_default_device_type(), max_length=77):
         super().__init__()
         self.tokenizer = CLIPTokenizer.from_pretrained(version)
         self.transformer = CLIPTextModel.from_pretrained(version)
+        self.vision = CLIPVisionModel.from_pretrained(version)
+        self.feature_extractor = CLIPFeatureExtractor.from_pretrained(version)
         self.device = device
         self.max_length = max_length
         self.freeze()
@@ -169,6 +177,11 @@ class FrozenCLIPEmbedder(AbstractEncoder):
 
     def encode(self, text):
         return self(text)
+    
+    def encode_image(self, pixel_values: FloatTensor) -> FloatTensor:
+        outputs: BaseModelOutputWithPooling = self.vision.forward(pixel_values)
+        z: FloatTensor = outputs.last_hidden_state
+        return z
 
 
 class FrozenCLIPTextEmbedder(nn.Module):

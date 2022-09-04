@@ -2,9 +2,11 @@ import argparse, os, sys, glob
 import cv2
 import torch
 import numpy as np
-from torch import Tensor
+from numpy.typing import _ArrayLikeFloat_co
+from torch import Tensor, FloatTensor
 from omegaconf import OmegaConf
 from PIL import Image
+from PIL.Image import Resampling
 from tqdm import tqdm, trange
 # from imwatermark import WatermarkEncoder
 from itertools import islice
@@ -15,9 +17,11 @@ from pytorch_lightning import seed_everything
 from torch import autocast, nn
 from contextlib import contextmanager, nullcontext
 from random import randint
-from typing import Optional, Iterable
+from typing import Optional, Iterable, List
 import re
 from ldm.models.diffusion.ddpm import LatentDiffusion
+from ldm.modules.encoders.modules import FrozenCLIPEmbedder
+from transformers.feature_extraction_utils import BatchFeature
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -143,12 +147,12 @@ def right_pad_dims_to(x: Tensor, t: Tensor) -> Tensor:
     return t
   return t.view(*t.shape, *((1,) * padding_dims))
 
-def load_img(path):
+def load_img(path) -> FloatTensor:
     image = Image.open(path).convert("RGB")
     w, h = image.size
     print(f"loaded input image of size ({w}, {h}) from {path}")
     w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
-    image = image.resize((w, h), resample=Image.LANCZOS)
+    image = image.resize((w, h), resample=Resampling.LANCZOS)
     image = np.array(image).astype(np.float32) / 255.0
     image = image[None].transpose(0, 3, 1, 2)
     image = torch.from_numpy(image)
@@ -359,6 +363,18 @@ def main():
         help="path to the input image"
     )
     parser.add_argument(
+        "--cond_img",
+        type=str,
+        nargs="*",
+        help="image(s) used for guiding diffusion (the same way text prompts are used)"
+    )
+    parser.add_argument(
+        "--cond_img_dir",
+        type=str,
+        nargs="?",
+        help="dir of images used for guiding diffusion (the same way text prompts are used)"
+    )
+    parser.add_argument(
         "--strength",
         type=float,
         default=0.75,
@@ -481,6 +497,39 @@ def main():
         image = repeat(image, '1 ... -> b ...', b=batch_size)
         latent: Tensor = model.get_first_stage_encoding(model.encode_first_stage(image))  # move to latent space
         return latent
+    
+    def img_to_encoding(path: str) -> Tensor:
+        assert os.path.isfile(path)
+        clip_embedder: FrozenCLIPEmbedder = model.cond_stage_model
+        image: Image = Image.open(path)
+        output: BatchFeature = clip_embedder.feature_extractor(
+            images=image,
+            resample=Resampling.LANCZOS,
+            size=512,
+            do_resize=True,
+            convert_rgb=True,
+            # from FrozenClipImageEmbedder
+            image_mean=[0.48145466, 0.4578275, 0.40821073],
+            image_std=[0.26862954, 0.26130258, 0.27577711],
+        )
+        batch_pixel_values: List[_ArrayLikeFloat_co] = output.data['pixel_values']
+        pixels: _ArrayLikeFloat_co = batch_pixel_values[0]
+        pixel_tensor: FloatTensor = torch.from_numpy(pixels)
+        encoding: FloatTensor = clip_embedder.encode_image(pixel_tensor).to(device)
+        return encoding
+    
+    cond_imgs: List[Tensor] = []
+    if opt.cond_img:
+        for img_path in opt.cond_img:
+            encoding: Tensor = img_to_encoding(img_path)
+            cond_imgs.append(encoding)
+    
+    if opt.cond_img_dir:
+        for img_filename in os.listdir(opt.cond_img_dir):
+            img_path = os.path.join(opt.cond_img_dir, img_filename)
+            assert os.path.isfile(img_path)
+            encoding: Tensor = img_to_encoding(img_path)
+            cond_imgs.append(encoding)
 
     init_latent = None
     if opt.init_img:
@@ -618,7 +667,8 @@ def main():
                             if init_latent is not None:
                                 x = init_latent + x
                             extra_args = {
-                                'conditions': (c,),
+                                # TODO: do we need to repeat each cond_img batch_size times? we did it for uc, but not for c…
+                                'conditions': (c, *cond_imgs),
                                 'uncond': uc,
                                 'cond_scale': opt.scale,
                             }
