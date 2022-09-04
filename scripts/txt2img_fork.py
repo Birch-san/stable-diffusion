@@ -52,14 +52,15 @@ class KCFGDenoiser(nn.Module):
         self.inner_model = model
 
     def forward(self, x: Tensor, sigma: Tensor, uncond: Tensor, cond: Tensor, img_conditions: Iterable[Tensor], cond_scale: float) -> Tensor:
-        x_in = torch.cat([x] * 2)
-        sigma_in = torch.cat([sigma] * 2)
         img_conditions = [right_pad_dims_to(img_condition, uncond) for img_condition in img_conditions]
+        chunks = 2 + len(img_conditions)
+        x_in = torch.cat([x] * chunks)
+        sigma_in = torch.cat([sigma] * chunks)
         cond_in = torch.cat([uncond, cond, *img_conditions])
-        img_conditions_len = len(img_conditions)
-        uncond, cond, *img_conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2 + img_conditions_len)
-        cond = torch.sum(torch.stack(img_conditions), dim=0) / img_conditions_len
-        return uncond + (cond - uncond) * cond_scale
+        uncond, cond, *img_conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(chunks)
+
+        img_cond = (torch.sum(torch.stack(img_conditions), dim=0) / len(img_conditions)) if img_conditions else torch.zeros_like(uncond, device=uncond.device)
+        return uncond + (cond + img_cond - uncond) * cond_scale
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
@@ -521,8 +522,10 @@ def main():
             cond_imgs.append(encoding)
     
     if opt.cond_img_dir:
-        for img_filename in os.listdir(opt.cond_img_dir):
+        assert os.path.isdir(opt.cond_img_dir)
+        for img_filename in glob.glob(os.path.join(opt.cond_img_dir, "*.png")):
             img_path = os.path.join(opt.cond_img_dir, img_filename)
+
             assert os.path.isfile(img_path)
             encoding: Tensor = img_to_encoding(img_path)
             cond_imgs.append(encoding)
