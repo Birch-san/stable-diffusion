@@ -15,7 +15,7 @@ from pytorch_lightning import seed_everything
 from torch import autocast, nn
 from contextlib import contextmanager, nullcontext
 from random import randint
-from typing import Optional, Iterable
+from typing import Optional, Iterable, NamedTuple, List
 import re
 from ldm.models.diffusion.ddpm import LatentDiffusion
 
@@ -47,13 +47,35 @@ class KCFGDenoiser(nn.Module):
         super().__init__()
         self.inner_model = model
 
-    def forward(self, x: Tensor, sigma: Tensor, uncond: Tensor, conditions: Iterable[Tensor], cond_scale: float) -> Tensor:
-        x_in = torch.cat([x] * 2)
-        sigma_in = torch.cat([sigma] * 2)
-        cond_in = torch.cat([uncond, *conditions])
-        conditions_len = len(conditions)
-        uncond, *conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(1 + conditions_len)
-        cond = torch.sum(torch.stack(conditions), dim=0) / conditions_len
+    def forward(
+        self,
+        x: Tensor,
+        sigma: Tensor,
+        uncond: Tensor,
+        conditions: Iterable[Tensor], 
+        cond_scale: float,
+        condition_weights: Optional[Iterable[float]] = None
+    ) -> Tensor:
+        if condition_weights is None and conditions:
+            condition_weights = (1. / len(conditions),) * len(conditions)
+        assert(len(conditions) == len(condition_weights))
+        
+        cond_ins = [uncond, *conditions]
+        cond_in_count = len(cond_ins)
+        x_in = torch.cat([x] * cond_in_count)
+        sigma_in = torch.cat([sigma] * cond_in_count)
+        cond_in = torch.cat(cond_ins)
+        uncond, *conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(cond_in_count)
+        if conditions:
+            # transform
+            #   tensor([0.5, 0.1])
+            # into:
+            #   tensor([[[[[0.5000]]]],
+            #           [[[[0.1000]]]]])
+            weight_tensor = torch.tensor(condition_weights, device=uncond.device).reshape(len(condition_weights), 1, 1, 1, 1)
+            cond = torch.sum(torch.stack(conditions) * weight_tensor, dim=0)
+        else:
+            cond = torch.zeros_like(uncond, device=uncond.device)
         return uncond + (cond - uncond) * cond_scale
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
@@ -154,6 +176,10 @@ def load_img(path):
     image = torch.from_numpy(image)
     return 2.*image - 1.
 
+class WeightedPrompt(NamedTuple):
+    prompt: str
+    weight: float
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -162,9 +188,9 @@ def main():
     parser.add_argument(
         "--prompt",
         type=str,
-        nargs="?",
+        nargs="+",
         default="a painting of a virus monster playing guitar",
-        help="the prompt to render"
+        help="the prompt to render. you can express your prompt as '0.5:piano villain' to halve its effect. negative numbers accepted. try multiple prompts with differing weights. as a starting point, try to ensure your multi-prompts' weights add up to 1.0. use --scale to increase the strength."
     )
     parser.add_argument(
         "--outdir",
@@ -398,18 +424,24 @@ def main():
     # wm_encoder = WatermarkEncoder()
     # wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
 
+    def parse_prompt(prompt: str) -> WeightedPrompt:
+        match = re.search(r"^-?\d+(\.\d*)?:", prompt)
+        if match is None:
+            return prompt, 1.0
+        group = match.group()[:-1]
+        prompt_weight = float(group)
+        return WeightedPrompt(prompt[len(group):], prompt_weight)
+
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
     if not opt.from_file:
-        prompt = opt.prompt
-        assert prompt is not None
-        data = [batch_size * [prompt]]
+        data: Iterable[Iterable[WeightedPrompt]] = batch_size * [[parse_prompt(prompt) for prompt in opt.prompt]]
 
     else:
         print(f"reading prompts from {opt.from_file}")
         with open(opt.from_file, "r") as f:
-            data = f.read().splitlines()
-            data = list(chunk(data, batch_size))
+            data: List[str] = f.read().splitlines()
+            data: Iterable[Iterable[WeightedPrompt]] = list(chunk((parse_prompt(prompt) for prompt in data), batch_size))
 
     sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)
@@ -497,12 +529,13 @@ def main():
                 all_samples = list()
                 for n in trange(opt.n_iter, desc="Sampling"):
                     iter_tic = time.perf_counter()
-                    for prompts in tqdm(data, desc="data"):
+                    for weighted_prompts in tqdm(data, desc="data"):
                         uc = None
                         if opt.scale != 1.0:
                             uc = model.get_learned_conditioning(batch_size * [""])
-                        if isinstance(prompts, tuple):
-                            prompts = list(prompts)
+                        prompts: List[str] = [weighted_prompt.prompt for weighted_prompt in weighted_prompts]
+                        prompt_weights: List[float] = [weighted_prompt.weight for weighted_prompt in weighted_prompts]
+                        # TODO: it looks like this thing already expected to be given multiple prompts. figure out what it returns.
                         c = model.get_learned_conditioning(prompts)
 
                         # if init_latent is None and (start_code is None or not opt.fixed_code):
@@ -618,7 +651,9 @@ def main():
                             if init_latent is not None:
                                 x = init_latent + x
                             extra_args = {
+                                # TODO: pass multiple conditions
                                 'conditions': (c,),
+                                'condition_weights': prompt_weights,
                                 'uncond': uc,
                                 'cond_scale': opt.scale,
                             }
