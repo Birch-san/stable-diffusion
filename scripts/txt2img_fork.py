@@ -2,12 +2,12 @@ import argparse, os, sys, glob
 import cv2
 import torch
 import numpy as np
-from torch import Tensor
+from torch import Tensor, FloatTensor
 from omegaconf import OmegaConf
 from PIL import Image
 from tqdm import tqdm, trange
 # from imwatermark import WatermarkEncoder
-from itertools import islice
+from itertools import islice, repeat as repeat_
 from einops import rearrange, repeat
 from torchvision.utils import make_grid
 import time
@@ -15,9 +15,11 @@ from pytorch_lightning import seed_everything
 from torch import autocast, nn
 from contextlib import contextmanager, nullcontext
 from random import randint
-from typing import Optional, Iterable
+from typing import Optional, Iterable, List
 import re
 from ldm.models.diffusion.ddpm import LatentDiffusion
+import abc
+from dataclasses import dataclass
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -47,13 +49,34 @@ class KCFGDenoiser(nn.Module):
         super().__init__()
         self.inner_model = model
 
-    def forward(self, x: Tensor, sigma: Tensor, uncond: Tensor, conditions: Iterable[Tensor], cond_scale: float) -> Tensor:
-        x_in = torch.cat([x] * 2)
-        sigma_in = torch.cat([sigma] * 2)
-        cond_in = torch.cat([uncond, *conditions])
-        conditions_len = len(conditions)
-        uncond, *conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(1 + conditions_len)
-        cond = torch.sum(torch.stack(conditions), dim=0) / conditions_len
+    def forward(
+        self,
+        x: Tensor,
+        sigma: Tensor,
+        uncond: Tensor,
+        conditions: Iterable[Tensor], 
+        cond_scale: float,
+        condition_weights: Optional[Iterable[float]] = None
+    ) -> Tensor:
+        if condition_weights is None and conditions:
+            condition_weights = (1.,) * len(conditions)
+        assert(len(conditions) == len(condition_weights))
+        cond_ins = [uncond, *conditions]
+        cond_in_count = len(cond_ins)
+        x_in = torch.cat([x] * cond_in_count)
+        sigma_in = torch.cat([sigma] * cond_in_count)
+        cond_in = torch.cat(cond_ins)
+        uncond, *conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(cond_in_count)
+        if conditions:
+            # transform
+            #   tensor([0.5, 0.1])
+            # into:
+            #   tensor([[[[[0.5000]]]],
+            #           [[[[0.1000]]]]])
+            weight_tensor = torch.tensor(condition_weights, device=uncond.device).reshape(len(condition_weights), 1, 1, 1, 1)
+            cond = torch.sum(torch.stack(conditions) * weight_tensor, dim=0)
+        else:
+            cond = torch.zeros_like(uncond, device=uncond.device)
         return uncond + (cond - uncond) * cond_scale
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
@@ -153,6 +176,19 @@ def load_img(path):
     image = image[None].transpose(0, 3, 1, 2)
     image = torch.from_numpy(image)
     return 2.*image - 1.
+
+@dataclass
+class EverySampleSamePromptSpec():
+    prompt: str
+
+@dataclass
+class EverySampleDifferentPromptSpec():
+    prompts: List[str]
+
+@dataclass
+class BatchSpec(abc.ABC): pass
+BatchSpec.register(EverySampleSamePromptSpec)
+BatchSpec.register(EverySampleDifferentPromptSpec)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -398,18 +434,25 @@ def main():
     # wm_encoder = WatermarkEncoder()
     # wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
 
+    prompts_change_each_batch = opt.from_file
+    each_sample_has_same_prompt = opt.from_file
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-    if not opt.from_file:
-        prompt = opt.prompt
-        assert prompt is not None
-        data = [batch_size * [prompt]]
 
-    else:
+    batch_specs: Iterable[BatchSpec] = None
+    if opt.from_file:
         print(f"reading prompts from {opt.from_file}")
         with open(opt.from_file, "r") as f:
-            data = f.read().splitlines()
-            data = list(chunk(data, batch_size))
+            lines = f.read().splitlines()
+            batch_specs = [
+                EverySampleDifferentPromptSpec(
+                    prompts=list(chunk_)
+                ) for chunk_ in chunk(lines, batch_size)
+            ]
+    else:
+        prompt = opt.prompt
+        assert prompt is not None
+        batch_specs = repeat_(EverySampleSamePromptSpec(prompt=prompt), batch_size)
 
     sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)
@@ -495,15 +538,22 @@ def main():
             with model.ema_scope():
                 tic = time.perf_counter()
                 all_samples = list()
-                for n in trange(opt.n_iter, desc="Sampling"):
+                uc = None if opt.scale == 1.0 else model.get_learned_conditioning("").repeat(batch_size, 1, 1)
+                c: Optional[FloatTensor] = None
+                for n in trange(opt.n_iter, desc="Batches"):
                     iter_tic = time.perf_counter()
-                    for prompts in tqdm(data, desc="data"):
-                        uc = None
-                        if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
-                        if isinstance(prompts, tuple):
-                            prompts = list(prompts)
-                        c = model.get_learned_conditioning(prompts)
+                    for batch_spec in tqdm(batch_specs, desc=f"Samples within batch {n}"):
+                        if c is None or prompts_change_each_batch:
+                            match batch_spec:
+                                case EverySampleSamePromptSpec(prompt):
+                                    nominal = model.get_learned_conditioning(prompt)
+                                    # c = model.get_learned_conditioning(prompt).repeat(batch_size, 1, 1)
+                                    c = nominal.repeat(batch_size, 1, 1)
+                                case EverySampleDifferentPromptSpec(prompts):
+                                    assert len(prompts) == batch_size
+                                    c = model.get_learned_conditioning(prompts)
+                                case _:
+                                    raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
 
                         # if init_latent is None and (start_code is None or not opt.fixed_code):
                         if start_code is None or not opt.fixed_code:
