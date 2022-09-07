@@ -54,30 +54,33 @@ class KCFGDenoiser(nn.Module):
         x: Tensor,
         sigma: Tensor,
         uncond: Tensor,
-        conditions: Iterable[Tensor], 
+        cond: Tensor, 
         cond_scale: float,
         condition_weights: Optional[Iterable[float]] = None
     ) -> Tensor:
-        if condition_weights is None and conditions:
-            condition_weights = (1.,) * len(conditions)
-        assert(len(conditions) == len(condition_weights))
-        cond_ins = [uncond, *conditions]
-        cond_in_count = len(cond_ins)
-        x_in = torch.cat([x] * cond_in_count)
-        sigma_in = torch.cat([sigma] * cond_in_count)
-        cond_in = torch.cat(cond_ins)
-        uncond, *conditions = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(cond_in_count)
-        if conditions:
-            # transform
-            #   tensor([0.5, 0.1])
-            # into:
-            #   tensor([[[[[0.5000]]]],
-            #           [[[[0.1000]]]]])
-            weight_tensor = torch.tensor(condition_weights, device=uncond.device).reshape(len(condition_weights), 1, 1, 1, 1)
-            cond = torch.sum(torch.stack(conditions) * weight_tensor, dim=0)
-        else:
-            cond = torch.zeros_like(uncond, device=uncond.device)
-        return uncond + (cond - uncond) * cond_scale
+        if condition_weights is None:
+            condition_weights = (1.,) * cond.size(0)
+        assert(cond.size(0) == len(condition_weights))
+        cond_in = torch.cat((uncond, cond))
+        del uncond, cond
+        x_in = x.expand(cond_in.size(0), -1, -1, -1)
+        del x
+        sigma_in = sigma.expand(cond_in.size(0))
+        del sigma
+        uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in).split([1, cond_in.size(0)-1])
+        del x_in
+        del sigma_in
+        del cond_in
+
+        # transform
+        #   tensor([0.5, 0.1])
+        # into:
+        #   tensor([[[[0.5000]]],
+        #           [[[0.1000]]]])
+        weight_tensor = torch.tensor(condition_weights, device=uncond_out.device).reshape(len(condition_weights), 1, 1, 1)
+        conds_out = torch.sum(conds_out * weight_tensor, dim=0)
+        del weight_tensor
+        return uncond_out + (conds_out - uncond_out) * cond_scale
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
@@ -561,6 +564,7 @@ def main():
                 all_samples = list()
                 uc = None if opt.scale == 1.0 else model.get_learned_conditioning("").repeat(batch_size, 1, 1)
                 c: Optional[FloatTensor] = None
+                condition_weights: Optional[Iterable[float]] = None
                 for n in trange(opt.n_iter, desc="Batches"):
                     iter_tic = time.perf_counter()
                     for batch_spec in tqdm(batch_specs, desc=f"Samples within batch {n}"):
@@ -568,13 +572,15 @@ def main():
                             match batch_spec:
                                 case EverySampleSamePromptSpec(multiprompt):
                                     prompts: List[str] = [multiprompt_instance.prompt for multiprompt_instance in multiprompt]
-                                    c = model.get_learned_conditioning(prompts).repeat(batch_size, 1, 1)
+                                    condition_weights: List[float] = [multiprompt_instance.weight for multiprompt_instance in multiprompt]
+                                    c = model.get_learned_conditioning(prompts).expand(batch_size * len(prompts), -1, -1)
                                 case EverySampleDifferentPromptSpec(multiprompts):
                                     assert len(multiprompts) == batch_size
                                     # TODO: each sample can have a different numbed of prompts in their multiprompt…
                                     #       we'd need to pad each to the length of the longest. probably not worth the complexity.
                                     #       easier to just disable multiprompts for files instead.
                                     prompts: List[str] = [multiprompt_instance.prompt for multiprompt in multiprompts for multiprompt_instance in multiprompt]
+                                    condition_weights: List[float] = [multiprompt_instance.weight for multiprompt in multiprompts for multiprompt_instance in multiprompt]
                                     c = model.get_learned_conditioning(prompts)
                                 case _:
                                     raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
@@ -692,8 +698,9 @@ def main():
                             if init_latent is not None:
                                 x = init_latent + x
                             extra_args = {
-                                'conditions': (c,),
+                                'cond': c,
                                 'uncond': uc,
+                                'condition_weights': condition_weights,
                                 'cond_scale': opt.scale,
                             }
                             samples = sampling_fn(
