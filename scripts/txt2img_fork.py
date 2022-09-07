@@ -71,16 +71,13 @@ class KCFGDenoiser(nn.Module):
         del x_in
         del sigma_in
         del cond_in
-
         # transform
         #   tensor([0.5, 0.1])
         # into:
         #   tensor([[[[0.5000]]],
         #           [[[0.1000]]]])
-        weight_tensor = torch.tensor(condition_weights, device=uncond_out.device).reshape(len(condition_weights), 1, 1, 1)
-        conds_out = torch.sum(conds_out * weight_tensor, dim=0)
-        del weight_tensor
-        return uncond_out + (conds_out - uncond_out) * cond_scale
+        weight_tensor = (torch.tensor(condition_weights, device=uncond_out.device) * cond_scale).reshape(len(condition_weights), 1, 1, 1)
+        return uncond_out + torch.sum((conds_out - uncond_out.expand(conds_out.shape)) * weight_tensor, dim=0, keepdim=True)
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
