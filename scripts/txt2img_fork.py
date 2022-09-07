@@ -188,7 +188,7 @@ def parse_prompt(prompt: str) -> WeightedPrompt:
         return WeightedPrompt(prompt=prompt, weight=1.0)
     group = match.group()[:-1]
     weight = float(group)
-    return WeightedPrompt(prompt=prompt[len(group):], weight=weight)
+    return WeightedPrompt(prompt=prompt[len(group)+1:], weight=weight)
 
 MultiPrompt: TypeAlias = Iterable[WeightedPrompt]
 
@@ -449,7 +449,7 @@ def main():
     # wm_encoder = WatermarkEncoder()
     # wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
 
-    prompts_change_each_batch = opt.from_file
+    prompts_change_each_batch = bool(opt.from_file)
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
 
@@ -472,7 +472,7 @@ def main():
             EverySampleSamePromptSpec(
                 multiprompt=[parse_prompt(prompt) for prompt in opt.prompt]
             ),
-            batch_size
+            opt.n_iter
         )
 
     sample_path = os.path.join(outpath, "samples")
@@ -564,7 +564,7 @@ def main():
                 condition_weights: Optional[Iterable[float]] = None
                 for n in trange(opt.n_iter, desc="Batches"):
                     iter_tic = time.perf_counter()
-                    for batch_spec in tqdm(batch_specs, desc=f"Samples within batch {n}"):
+                    for batch_spec in tqdm(batch_specs, desc=f"Batch {n}, sample"):
                         if c is None or prompts_change_each_batch:
                             match batch_spec:
                                 case EverySampleSamePromptSpec(multiprompt):
@@ -573,7 +573,7 @@ def main():
                                     c = model.get_learned_conditioning(prompts).expand(batch_size * len(prompts), -1, -1)
                                 case EverySampleDifferentPromptSpec(multiprompts):
                                     assert len(multiprompts) == batch_size
-                                    # TODO: each sample can have a different numbed of prompts in their multiprompt…
+                                    # TODO: each sample can have a different number of prompts in their multiprompt…
                                     #       we'd need to pad each to the length of the longest. probably not worth the complexity.
                                     #       easier to just disable multiprompts for files instead.
                                     prompts: List[str] = [multiprompt_instance.prompt for multiprompt in multiprompts for multiprompt_instance in multiprompt]
