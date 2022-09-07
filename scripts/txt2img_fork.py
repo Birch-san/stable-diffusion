@@ -15,7 +15,7 @@ from pytorch_lightning import seed_everything
 from torch import autocast, nn
 from contextlib import contextmanager, nullcontext
 from random import randint
-from typing import Optional, Iterable, List
+from typing import Optional, Iterable, List, TypeAlias
 import re
 from ldm.models.diffusion.ddpm import LatentDiffusion
 import abc
@@ -178,12 +178,27 @@ def load_img(path):
     return 2.*image - 1.
 
 @dataclass
-class EverySampleSamePromptSpec():
+class WeightedPrompt():
     prompt: str
+    weight: float
+
+def parse_prompt(prompt: str) -> WeightedPrompt:
+    match = re.search(r"^-?\d+(\.\d*)?:", prompt)
+    if match is None:
+        return WeightedPrompt(prompt=prompt, weight=1.0)
+    group = match.group()[:-1]
+    weight = float(group)
+    return WeightedPrompt(prompt=prompt[len(group):], weight=weight)
+
+MultiPrompt: TypeAlias = Iterable[WeightedPrompt]
+
+@dataclass
+class EverySampleSamePromptSpec():
+    multiprompt: MultiPrompt
 
 @dataclass
 class EverySampleDifferentPromptSpec():
-    prompts: List[str]
+    multiprompts: List[MultiPrompt]
 
 @dataclass
 class BatchSpec(abc.ABC): pass
@@ -198,9 +213,9 @@ def main():
     parser.add_argument(
         "--prompt",
         type=str,
-        nargs="?",
+        nargs="+",
         default="a painting of a virus monster playing guitar",
-        help="the prompt to render"
+        help="the prompt to render. you can express your prompt as '0.5:piano villain' to halve its effect. negative numbers accepted. try multiple prompts with differing weights. --scale can be used to further amplify the difference between your summed prompts and the unconditional prompt."
     )
     parser.add_argument(
         "--outdir",
@@ -435,7 +450,6 @@ def main():
     # wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
 
     prompts_change_each_batch = opt.from_file
-    each_sample_has_same_prompt = opt.from_file
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
 
@@ -446,13 +460,20 @@ def main():
             lines = f.read().splitlines()
             batch_specs = [
                 EverySampleDifferentPromptSpec(
-                    prompts=list(chunk_)
+                    # every line in the chunk is considered to be a single multiprompt.
+                    # splitting the line on tab, gives each prompt of the multiprompt.
+                    multiprompts=list([prompt for prompt in '\t'.split(line)] for line in chunk_)
                 ) for chunk_ in chunk(lines, batch_size)
             ]
     else:
         prompt = opt.prompt
         assert prompt is not None
-        batch_specs = repeat_(EverySampleSamePromptSpec(prompt=prompt), batch_size)
+        batch_specs = repeat_(
+            EverySampleSamePromptSpec(
+                multiprompt=[parse_prompt(prompt) for prompt in opt.prompt]
+            ),
+            batch_size
+        )
 
     sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)
@@ -490,7 +511,7 @@ def main():
         if opt.filename_seed:
             seed = f".s{opt.seed}"
         if opt.filename_prompt:
-            sanitized = re.sub(r"[/\\?%*:|\"<>\x7F\x00-\x1F]", "-", opt.prompt)
+            sanitized = re.sub(r"[/\\?%*:|\"<>\x7F\x00-\x1F]", "-", '_'.join(opt.prompt))
             prompt = f"_{sanitized}_"
         if opt.filename_sample_ix:
             sample_ix_ = sample_ix
@@ -545,12 +566,15 @@ def main():
                     for batch_spec in tqdm(batch_specs, desc=f"Samples within batch {n}"):
                         if c is None or prompts_change_each_batch:
                             match batch_spec:
-                                case EverySampleSamePromptSpec(prompt):
-                                    nominal = model.get_learned_conditioning(prompt)
-                                    # c = model.get_learned_conditioning(prompt).repeat(batch_size, 1, 1)
-                                    c = nominal.repeat(batch_size, 1, 1)
-                                case EverySampleDifferentPromptSpec(prompts):
-                                    assert len(prompts) == batch_size
+                                case EverySampleSamePromptSpec(multiprompt):
+                                    prompts: List[str] = [multiprompt_instance.prompt for multiprompt_instance in multiprompt]
+                                    c = model.get_learned_conditioning(prompts).repeat(batch_size, 1, 1)
+                                case EverySampleDifferentPromptSpec(multiprompts):
+                                    assert len(multiprompts) == batch_size
+                                    # TODO: each sample can have a different numbed of prompts in their multiprompt…
+                                    #       we'd need to pad each to the length of the longest. probably not worth the complexity.
+                                    #       easier to just disable multiprompts for files instead.
+                                    prompts: List[str] = [multiprompt_instance.prompt for multiprompt in multiprompts for multiprompt_instance in multiprompt]
                                     c = model.get_learned_conditioning(prompts)
                                 case _:
                                     raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
