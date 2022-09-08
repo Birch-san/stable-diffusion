@@ -560,7 +560,7 @@ def main():
             with model.ema_scope():
                 tic = time.perf_counter()
                 all_samples = list()
-                uc = None if opt.scale == 1.0 else model.get_learned_conditioning("").repeat(batch_size, 1, 1)
+                uc = None if opt.scale == 1.0 else model.get_learned_conditioning("").expand(batch_size, -1, -1)
                 c: Optional[FloatTensor] = None
                 condition_weights: Optional[Iterable[float]] = None
                 for n in trange(opt.n_iter, desc="Batches"):
