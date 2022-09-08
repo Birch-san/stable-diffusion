@@ -574,12 +574,16 @@ def main():
                                     c = model.get_learned_conditioning(prompts).expand(batch_size * len(prompts), -1, -1)
                                 case EverySampleDifferentPromptSpec(multiprompts):
                                     assert len(multiprompts) == batch_size
-                                    # TODO: each sample can have a different number of prompts in their multiprompt…
-                                    #       we'd need to pad each to the length of the longest. probably not worth the complexity.
-                                    #       easier to just disable multiprompts for files instead.
+                                    multiprompt_lengths = tuple(len(multiprompt) for multiprompt in multiprompts)
+                                    longest_multiprompt = max(multiprompt_lengths)
                                     prompts: List[str] = [multiprompt_instance.prompt for multiprompt in multiprompts for multiprompt_instance in multiprompt]
-                                    condition_weights: List[float] = [multiprompt_instance.weight for multiprompt in multiprompts for multiprompt_instance in multiprompt]
+                                    # each sample in the batch needs the same number of weights
+                                    # from each multiprompt, grab its every weight. pad with additional 1. weights if the given multiprompt has fewer elements than the longest
+                                    condition_weights: List[float] = [weight for weights in ((multiprompt_element.weight, *(1.,) * (longest_multiprompt-len(multiprompt))) for multiprompt in multiprompts for multiprompt_element in multiprompt) for weight in weights]
                                     c = model.get_learned_conditioning(prompts)
+                                    # each sample in the batch needs the same number of conditions
+                                    # pad each condition with uncond rows so that each sample has the same number of conditions as the longest multiprompt in the batch
+                                    c = torch.cat(torch.cat((cond, uc[0:1].expand(longest_multiprompt-cond.size(dim=0), -1, -1))) for cond in c.split(multiprompt_lengths, 0))
                                 case _:
                                     raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
 
