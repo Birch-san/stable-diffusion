@@ -583,7 +583,7 @@ def main():
                                     c = model.get_learned_conditioning(prompts)
                                     # each sample in the batch needs the same number of conditions
                                     # pad each condition with uncond rows so that each sample has the same number of conditions as the longest multiprompt in the batch
-                                    c = torch.cat(torch.cat((cond, uc[0:1].expand(longest_multiprompt-cond.size(dim=0), -1, -1))) for cond in c.split(multiprompt_lengths, 0))
+                                    c = torch.cat(list(torch.cat((cond, uc[0:1].expand(longest_multiprompt-cond.size(dim=0), -1, -1))) for cond in c.split(multiprompt_lengths, 0)))
                                 case _:
                                     raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
 
