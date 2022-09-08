@@ -463,7 +463,7 @@ def main():
                 EverySampleDifferentPromptSpec(
                     # every line in the chunk is considered to be a single multiprompt.
                     # splitting the line on tab, gives each prompt of the multiprompt.
-                    multiprompts=list([prompt for prompt in '\t'.split(line)] for line in chunk_)
+                    multiprompts=list([parse_prompt(prompt) for prompt in line.split('\t')] for line in chunk_)
                 ) for chunk_ in chunk(lines, batch_size)
             ]
     else:
