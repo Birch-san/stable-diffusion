@@ -64,9 +64,10 @@ class KCFGDenoiser(nn.Module):
         assert(cond.size(0) == len(condition_weights))
         cond_in = torch.cat((uncond, cond))
         del uncond, cond
-        x_in = x.expand(cond_in.size(0), -1, -1, -1)
+        # x_in = x.expand(cond_in.size(0), -1, -1, -1)
+        x_in = x.repeat((cond_in.size(0)//x.size(0), 1, 1, 1))
         del x
-        sigma_in = sigma.expand(cond_in.size(0))
+        sigma_in = sigma.repeat((cond_in.size(0)//sigma.size(0), 1))
         del sigma
         uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in).split([1, cond_in.size(0)-1])
         del x_in
@@ -78,7 +79,8 @@ class KCFGDenoiser(nn.Module):
         #   tensor([[[[0.5000]]],
         #           [[[0.1000]]]])
         weight_tensor = (torch.tensor(condition_weights, device=uncond_out.device) * cond_scale).reshape(len(condition_weights), 1, 1, 1)
-        return uncond_out + torch.sum((conds_out - uncond_out.expand(conds_out.shape)) * weight_tensor, dim=0, keepdim=True)
+        # return uncond_out + torch.sum((conds_out - uncond_out.expand(conds_out.shape)) * weight_tensor, dim=0, keepdim=True)
+        return uncond_out + torch.sum((conds_out - uncond_out.repeat(conds_out.size(0)//uncond_out.size(0), 1, 1, 1)) * weight_tensor, dim=0, keepdim=True)
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
@@ -570,8 +572,11 @@ def main():
                             match batch_spec:
                                 case EverySampleSamePromptSpec(multiprompt):
                                     prompts: List[str] = [multiprompt_instance.prompt for multiprompt_instance in multiprompt]
-                                    condition_weights: List[float] = [multiprompt_instance.weight for multiprompt_instance in multiprompt]
-                                    c = model.get_learned_conditioning(prompts).expand(batch_size * len(prompts), -1, -1)
+                                    condition_weights: List[float] = [multiprompt_instance.weight for multiprompt_instance in multiprompt] * batch_size
+                                    p = model.get_learned_conditioning(prompts)
+                                    # p.repeat() would work in both cases, but 
+                                    c = p.expand(batch_size * p.size(dim=0), -1, -1) if batch_size == 1 else p.repeat((batch_size, 1, 1))
+                                    del p
                                 case EverySampleDifferentPromptSpec(multiprompts):
                                     assert len(multiprompts) == batch_size
                                     multiprompt_lengths = tuple(len(multiprompt) for multiprompt in multiprompts)
