@@ -62,14 +62,14 @@ class KCFGDenoiser(nn.Module):
         if condition_weights is None:
             condition_weights = (1.,) * cond.size(0)
         assert(cond.size(0) == len(condition_weights))
+        sample_count = uncond.size(dim=0)
         cond_in = torch.cat((uncond, cond))
         del uncond, cond
-        # x_in = x.expand(cond_in.size(0), -1, -1, -1)
         x_in = x.repeat((cond_in.size(0)//x.size(0), 1, 1, 1))
         del x
-        sigma_in = sigma.repeat((cond_in.size(0)//sigma.size(0), 1))
+        sigma_in = sigma.repeat((cond_in.size(0)//sigma.size(0)))
         del sigma
-        uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in).split([1, cond_in.size(0)-1])
+        uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in).split([sample_count, cond_in.size(0)-sample_count])
         del x_in
         del sigma_in
         del cond_in
@@ -79,8 +79,7 @@ class KCFGDenoiser(nn.Module):
         #   tensor([[[[0.5000]]],
         #           [[[0.1000]]]])
         weight_tensor = (torch.tensor(condition_weights, device=uncond_out.device) * cond_scale).reshape(len(condition_weights), 1, 1, 1)
-        # return uncond_out + torch.sum((conds_out - uncond_out.expand(conds_out.shape)) * weight_tensor, dim=0, keepdim=True)
-        return uncond_out + torch.sum((conds_out - uncond_out.repeat(conds_out.size(0)//uncond_out.size(0), 1, 1, 1)) * weight_tensor, dim=0, keepdim=True)
+        return uncond_out + torch.sum((conds_out - uncond_out.repeat_interleave(conds_out.size(0)//uncond_out.size(0), dim=0)) * weight_tensor, dim=0, keepdim=True)
 
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from transformers import AutoFeatureExtractor
