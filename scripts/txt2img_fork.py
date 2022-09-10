@@ -48,9 +48,11 @@ class KCFGDenoiser(nn.Module):
         self.inner_model = model
 
     def forward(self, x: Tensor, sigma: Tensor, uncond: Tensor, cond: Tensor, cond_scale: float) -> Tensor:
-        x_in = torch.cat([x] * 2)
-        sigma_in = torch.cat([sigma] * 2)
-        cond_in = torch.cat([uncond, cond])
+        cond_in = torch.cat((uncond, cond))
+        del uncond, cond
+        x_in = x.repeat((cond_in.size(0)//x.size(0), 1, 1, 1))
+        del x
+        sigma_in = sigma.repeat((cond_in.size(0)//sigma.size(0)))
         uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2)
         return uncond + (cond - uncond) * cond_scale
 
@@ -493,15 +495,17 @@ def main():
             with model.ema_scope():
                 tic = time.perf_counter()
                 all_samples = list()
+                uc = None if opt.scale == 1.0 else model.get_learned_conditioning("").expand(batch_size, -1, -1)
                 for n in trange(opt.n_iter, desc="Sampling"):
                     iter_tic = time.perf_counter()
                     for prompts in tqdm(data, desc="data"):
-                        uc = None
-                        if opt.scale != 1.0:
-                            uc = model.get_learned_conditioning(batch_size * [""])
-                        if isinstance(prompts, tuple):
-                            prompts = list(prompts)
-                        c = model.get_learned_conditioning(prompts)
+                        # uc = None
+                        # if opt.scale != 1.0:
+                        #     uc = model.get_learned_conditioning(batch_size * [""])
+                        # if isinstance(prompts, tuple):
+                        #     prompts = list(prompts)
+                        # c = model.get_learned_conditioning(prompts[0]).repeat((batch_size, 1, 1))
+                        c = model.get_learned_conditioning(prompts[0]).expand(batch_size, -1, -1)
 
                         # if init_latent is None and (start_code is None or not opt.fixed_code):
                         if start_code is None or not opt.fixed_code:
