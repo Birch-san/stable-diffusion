@@ -65,13 +65,13 @@ class KCFGDenoiser(nn.Module):
         cond_in = torch.cat((uncond, cond))
         del uncond, cond
         cond_arities_tensor = torch.tensor(cond_arities, device=cond_in.device)
-        x_in = torch.cat((x, x.repeat_interleave(cond_arities_tensor, dim=0, output_size=cond_count)))
+        x_in = torch.cat((x, repeat_interleave_along_dim_0(t=x, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)))
         del x
-        sigma_in = torch.cat((sigma, sigma.repeat_interleave(cond_arities_tensor, dim=0, output_size=cond_count)))
+        sigma_in = torch.cat((sigma, repeat_interleave_along_dim_0(t=sigma, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)))
         del sigma
         uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in).split([uncond_count, cond_count])
         del x_in, sigma_in, cond_in
-        unconds = uncond_out.repeat_interleave(cond_arities_tensor, dim=0, output_size=cond_count)
+        unconds = repeat_interleave_along_dim_0(t=uncond_out, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
         del cond_arities_tensor
         # transform
         #   tensor([0.5, 0.1])
@@ -131,11 +131,35 @@ def repeat_along_dim_0(t: Tensor, factor: int) -> Tensor:
     # shape changes from (2, 2)
     #                 to (4, 2)
     """
+    assert factor >= 1
+    if factor == 1:
+        return t
     if t.size(dim=0) == 1:
         # prefer expand() whenever we can, since doesn't copy
         return t.expand(factor * t.size(dim=0), *(-1,)*(t.ndim-1))
     return t.repeat((factor, *(1,)*(t.ndim-1)))
 
+def repeat_interleave_along_dim_0(t: Tensor, factors: Iterable[int], factors_tensor: Tensor, output_size: int) -> Tensor:
+    """
+    factors=(2,3)
+    factors_tensor = torch.tensor(factors)
+    output_size=factors_tensor.sum().item() # 5
+    t=torch.tensor([[0,1],[2,3]])
+    repeat_interleave_along_dim_0(t=t, factors=factors, factors_tensor=factors_tensor, output_size=output_size)
+    tensor([[0, 1],
+            [0, 1],
+            [2, 3],
+            [2, 3],
+            [2, 3]])
+    """
+    factors_len = len(factors)
+    assert factors_len >= 1
+    if len(factors) == 1:
+        # prefer repeat() whenever we can, because MPS doesn't support repeat_interleave()
+        return repeat_along_dim_0(t, factors[0])
+    if t.device.type != 'mps':
+        return t.repeat_interleave(factors_tensor, dim=0, output_size=output_size)
+    return torch.cat([repeat_along_dim_0(split, factor) for split, factor in zip(t.split(1, dim=0), factors)])
 
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}")
