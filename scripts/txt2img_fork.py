@@ -81,11 +81,9 @@ class KCFGDenoiser(nn.Module):
         weight_tensor = (torch.tensor(cond_weights, device=uncond_out.device) * cond_scale).reshape(len(cond_weights), 1, 1, 1)
         deltas: Tensor = (conds_out-unconds) * weight_tensor
         del conds_out, unconds, weight_tensor
-        split_deltas: List[Tensor] = deltas.split(cond_arities)
+        cond = sum_along_slices_of_dim_0(deltas, arities=cond_arities)
         del deltas
-        sums: List[Tensor] = [torch.sum(split_delta, dim=0, keepdim=True) for split_delta in split_deltas]
-        del split_deltas
-        return uncond_out + torch.cat(sums)
+        return uncond_out + cond
 
 # from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 # from transformers import AutoFeatureExtractor
@@ -198,6 +196,33 @@ def cat_self_with_repeat_interleaved(t: Tensor, factors: Iterable[int], factors_
     if len(factors) == 1:
         return repeat_along_dim_0(t, factors[0]+1)
     return torch.cat((t, repeat_interleave_along_dim_0(t=t, factors_tensor=factors_tensor, factors=factors, output_size=output_size)))
+
+def sum_along_slices_of_dim_0(t: Tensor, arities: Iterable[int]) -> Tensor:
+    """
+    Implements fast-path for a pattern which in the worst-case looks like this:
+    t=torch.tensor([[1],[2],[3]])
+    arities=(2,1)
+    torch.cat([torch.sum(split, dim=0, keepdim=True) for split in t.split(arities)])
+    tensor([[3],
+            [3]])
+
+    Fast-path:
+      `len(arities) == 1`
+      it's just a normal sum(t, dim=0, keepdim=True)
+    t=torch.tensor([[1],[2]])
+    arities=(2)
+    t.sum(dim=0, keepdim=True)
+    tensor([[3]])
+    """
+    if len(arities) == 1:
+        if t.size(dim=0) == 1:
+            return t
+        return t.sum(dim=0, keepdim=True)
+    splits: List[Tensor] = t.split(arities)
+    del t
+    sums: List[Tensor] = [torch.sum(split, dim=0, keepdim=True) for split in splits]
+    del splits
+    return torch.cat(sums)
 
 
 def load_model_from_config(config, ckpt, verbose=False):
