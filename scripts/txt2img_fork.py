@@ -65,9 +65,9 @@ class KCFGDenoiser(nn.Module):
         cond_in = torch.cat((uncond, cond))
         del uncond, cond
         cond_arities_tensor = torch.tensor(cond_arities, device=cond_in.device)
-        x_in = torch.cat((x, repeat_interleave_along_dim_0(t=x, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)))
+        x_in = cat_self_with_repeat_interleaved(t=x, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
         del x
-        sigma_in = torch.cat((sigma, repeat_interleave_along_dim_0(t=sigma, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)))
+        sigma_in = cat_self_with_repeat_interleaved(t=sigma, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
         del sigma
         uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in).split([uncond_count, cond_count])
         del x_in, sigma_in, cond_in
@@ -80,7 +80,7 @@ class KCFGDenoiser(nn.Module):
         #           [[[0.1000]]]])
         weight_tensor = (torch.tensor(cond_weights, device=uncond_out.device) * cond_scale).reshape(len(cond_weights), 1, 1, 1)
         deltas: Tensor = (conds_out-unconds) * weight_tensor
-        del weight_tensor
+        del conds_out, unconds, weight_tensor
         split_deltas: List[Tensor] = deltas.split(cond_arities)
         del deltas
         sums: List[Tensor] = [torch.sum(split_delta, dim=0, keepdim=True) for split_delta in split_deltas]
@@ -141,6 +141,8 @@ def repeat_along_dim_0(t: Tensor, factor: int) -> Tensor:
 
 def repeat_interleave_along_dim_0(t: Tensor, factors: Iterable[int], factors_tensor: Tensor, output_size: int) -> Tensor:
     """
+    repeat_interleave()s a tensor's contents along its 0th dim.
+
     factors=(2,3)
     factors_tensor = torch.tensor(factors)
     output_size=factors_tensor.sum().item() # 5
@@ -160,6 +162,43 @@ def repeat_interleave_along_dim_0(t: Tensor, factors: Iterable[int], factors_ten
     if t.device.type != 'mps':
         return t.repeat_interleave(factors_tensor, dim=0, output_size=output_size)
     return torch.cat([repeat_along_dim_0(split, factor) for split, factor in zip(t.split(1, dim=0), factors)])
+
+def cat_self_with_repeat_interleaved(t: Tensor, factors: Iterable[int], factors_tensor: Tensor, output_size: int) -> Tensor:
+    """
+    Fast-paths for a pattern which in its worst-case looks like:
+    t=torch.tensor([[0,1],[2,3]])
+    factors=(2,3)
+    torch.cat((t, t.repeat_interleave(factors, dim=0)))
+    tensor([[0, 1],
+            [2, 3],
+            [0, 1],
+            [0, 1],
+            [2, 3],
+            [2, 3],
+            [2, 3]])
+
+    Fast-path:
+      `len(factors) == 1`
+      it's just a normal repeat
+    t=torch.tensor([[0,1]])
+    factors=(2)
+    tensor([[0, 1],
+            [0, 1],
+            [0, 1]])
+    
+    t=torch.tensor([[0,1],[2,3]])
+    factors=(2)
+    tensor([[0, 1],
+            [2, 3],
+            [0, 1],
+            [2, 3],
+            [0, 1],
+            [2, 3]])
+    """
+    if len(factors) == 1:
+        return repeat_along_dim_0(t, factors[0]+1)
+    return torch.cat((t, repeat_interleave_along_dim_0(t=t, factors_tensor=factors_tensor, factors=factors, output_size=output_size)))
+
 
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}")
