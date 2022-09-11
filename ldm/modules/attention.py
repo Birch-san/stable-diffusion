@@ -191,9 +191,12 @@ class CrossAttention(nn.Module):
 
         # attention, what we cannot get enough of
         attn = sim.softmax(dim=-1)
+        del sim
 
         out = einsum('b i j, b j d -> b i d', attn, v)
+        del attn, v
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        del h
         return self.to_out(out)
 
 
