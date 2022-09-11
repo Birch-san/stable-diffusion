@@ -113,6 +113,29 @@ def numpy_to_pil(images):
 
     return pil_images
 
+def repeat_along_dim_0(t: Tensor, factor: int) -> Tensor:
+    """
+    Repeats a tensor's contents along its 0th dim `factor` times.
+
+    repeat_along_dim_0(torch.tensor([[0,1]]), 2)
+    tensor([[0, 1],
+            [0, 1]])
+    # shape changes from (1, 2)
+    #                 to (2, 2)
+    
+    repeat_along_dim_0(torch.tensor([[0,1],[2,3]]), 2)
+    tensor([[0, 1],
+            [2, 3],
+            [0, 1],
+            [2, 3]])
+    # shape changes from (2, 2)
+    #                 to (4, 2)
+    """
+    if t.size(dim=0) == 1:
+        # prefer expand() whenever we can, since doesn't copy
+        return t.expand(factor * t.size(dim=0), *(-1,)*(t.ndim-1))
+    return t.repeat((factor, *(1,)*(t.ndim-1)))
+
 
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}")
@@ -581,7 +604,7 @@ def main():
                                     cond_arities: Tuple[int, ...] = (len(prompts),) * batch_size
                                     cond_weights: List[float] = [multiprompt_instance.weight for multiprompt_instance in multiprompt] * batch_size
                                     p = model.get_learned_conditioning(prompts)
-                                    c = p.expand(batch_size * p.size(dim=0), -1, -1) if batch_size == 1 else p.repeat((batch_size, 1, 1))
+                                    c = repeat_along_dim_0(p, batch_size)
                                     del p
                                 case EverySampleDifferentPromptSpec(multiprompts):
                                     assert len(multiprompts) == batch_size
