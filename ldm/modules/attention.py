@@ -2,8 +2,9 @@ from inspect import isfunction
 import math
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum
+from torch import nn, einsum, BoolTensor, FloatTensor
 from einops import rearrange, repeat
+from typing import Optional
 
 from ldm.modules.diffusionmodules.util import checkpoint
 
@@ -167,7 +168,7 @@ class CrossAttention(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x, context=None, mask=None):
+    def forward(self, x: FloatTensor, context: Optional[FloatTensor]=None, mask: Optional[BoolTensor]=None):
         h = self.heads
 
         q = self.to_q(x)
@@ -196,7 +197,6 @@ class CrossAttention(nn.Module):
         out = einsum('b i j, b j d -> b i d', attn, v)
         del attn, v
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        del h
         return self.to_out(out)
 
 
@@ -212,13 +212,13 @@ class BasicTransformerBlock(nn.Module):
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
 
-    def forward(self, x, context=None):
-        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+    def forward(self, x: FloatTensor, context: Optional[FloatTensor]=None, mask: Optional[BoolTensor]=None):
+        return checkpoint(self._forward, (x, context, mask), self.parameters(), self.checkpoint)
 
-    def _forward(self, x, context=None):
+    def _forward(self, x: FloatTensor, context: Optional[FloatTensor]=None, mask: Optional[BoolTensor]=None):
         x = x.contiguous() if x.device.type == 'mps' else x
-        x += self.attn1(self.norm1(x))
-        x += self.attn2(self.norm2(x), context=context)
+        x += self.attn1(self.norm1(x), mask=mask)
+        x += self.attn2(self.norm2(x), context=context, mask=mask)
         x += self.ff(self.norm3(x))
         return x
 
@@ -255,7 +255,7 @@ class SpatialTransformer(nn.Module):
                                               stride=1,
                                               padding=0))
 
-    def forward(self, x, context=None):
+    def forward(self, x: FloatTensor, context: Optional[FloatTensor]=None, mask: Optional[BoolTensor]=None):
         # note: if no context is given, cross-attention defaults to self-attention
         b, c, h, w = x.shape
         x_in = x
@@ -263,7 +263,7 @@ class SpatialTransformer(nn.Module):
         x = self.proj_in(x)
         x = rearrange(x, 'b c h w -> b (h w) c')
         for block in self.transformer_blocks:
-            x = block(x, context=context)
+            x = block(x, context=context, mask=mask)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
         x = self.proj_out(x)
         return x + x_in

@@ -2,7 +2,7 @@ import argparse, os, sys, glob
 import cv2
 import torch
 import numpy as np
-from torch import Tensor, FloatTensor
+from torch import Tensor, FloatTensor, BoolTensor
 from omegaconf import OmegaConf
 from PIL import Image
 from PIL.Image import Resampling
@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
+from ldm.modules.encoders.modules import CLIPEmbedding
 
 from k_diffusion.sampling import sample_lms, sample_dpm_2, sample_dpm_2_ancestral, sample_euler, sample_euler_ancestral, sample_heun, get_sigmas_karras, append_zero
 from k_diffusion.external import CompVisDenoiser
@@ -55,7 +56,9 @@ class KCFGDenoiser(nn.Module):
         x: Tensor,
         sigma: Tensor,
         uncond: Tensor,
-        cond: Tensor, 
+        uncond_mask: BoolTensor,
+        cond: Tensor,
+        cond_mask: BoolTensor,
         cond_scale: float,
         cond_arities: Iterable[int],
         cond_weights: Optional[Iterable[float]]
@@ -64,13 +67,15 @@ class KCFGDenoiser(nn.Module):
         cond_count = cond.size(dim=0)
         cond_in = torch.cat((uncond, cond))
         del uncond, cond
+        cond_mask_in = torch.cat((uncond_mask, cond_mask))
+        del uncond_mask, cond_mask
         cond_arities_tensor = torch.tensor(cond_arities, device=cond_in.device)
         x_in = cat_self_with_repeat_interleaved(t=x, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
         del x
         sigma_in = cat_self_with_repeat_interleaved(t=sigma, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
         del sigma
-        uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in).split([uncond_count, cond_count])
-        del x_in, sigma_in, cond_in
+        uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in, mask=cond_mask_in).split([uncond_count, cond_count])
+        del x_in, sigma_in, cond_in, cond_mask_in
         unconds = repeat_interleave_along_dim_0(t=uncond_out, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
         del cond_arities_tensor
         # transform
@@ -678,8 +683,14 @@ def main():
             with model.ema_scope():
                 tic = time.perf_counter()
                 all_samples = list()
-                uc = None if opt.scale == 1.0 else model.get_learned_conditioning("").expand(batch_size, -1, -1)
+                uc = None
+                if opt.scale != 1.0:
+                    clip_embedding: CLIPEmbedding = model.get_learned_conditioning("")
+                    last_hidden_state, attention_mask = clip_embedding
+                    uc = last_hidden_state.expand(batch_size, -1, -1)
+                    uc_mask = attention_mask.expand(batch_size, -1)
                 c: Optional[FloatTensor] = None
+                c_mask: Optional[BoolTensor] = None
                 cond_weights: Optional[Iterable[float]] = None
                 cond_arities: Optional[Iterable[int]] = None
                 for n in trange(opt.n_iter, desc="Batches"):
@@ -691,15 +702,20 @@ def main():
                                     prompts: List[str] = [multiprompt_instance.prompt for multiprompt_instance in multiprompt]
                                     cond_arities: Tuple[int, ...] = (len(prompts),) * batch_size
                                     cond_weights: List[float] = [multiprompt_instance.weight for multiprompt_instance in multiprompt] * batch_size
-                                    p = model.get_learned_conditioning(prompts)
-                                    c = repeat_along_dim_0(p, batch_size)
-                                    del p
+                                    clip_embedding: CLIPEmbedding = model.get_learned_conditioning(prompts)
+                                    last_hidden_state, attention_mask = clip_embedding
+                                    c = repeat_along_dim_0(last_hidden_state, batch_size)
+                                    del last_hidden_state
+                                    c_mask = repeat_along_dim_0(attention_mask, batch_size)
                                 case EverySampleDifferentPromptSpec(multiprompts):
                                     assert len(multiprompts) == batch_size
                                     prompts: List[str] = [multiprompt_instance.prompt for multiprompt in multiprompts for multiprompt_instance in multiprompt]
                                     cond_weights: List[float] = [multiprompt_instance.weight for multiprompt in multiprompts for multiprompt_instance in multiprompt]
                                     cond_arities: List[int] = [len(multiprompt) for multiprompt in multiprompts]
-                                    c = model.get_learned_conditioning(prompts)
+                                    clip_embedding: CLIPEmbedding = model.get_learned_conditioning(prompts)
+                                    last_hidden_state, attention_mask = clip_embedding
+                                    c = last_hidden_state
+                                    c_mask = attention_mask
                                 case _:
                                     raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
 
@@ -817,7 +833,9 @@ def main():
                                 x = init_latent + x
                             extra_args = {
                                 'cond': c,
+                                'cond_mask': c_mask,
                                 'uncond': uc,
+                                'uncond_mask': uc_mask,
                                 'cond_weights': cond_weights,
                                 'cond_arities': cond_arities,
                                 'cond_scale': opt.scale,
