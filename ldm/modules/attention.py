@@ -179,7 +179,7 @@ class CrossAttention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        sim = torch.matmul(q, k.transpose(1, 2)) * self.scale
         del q, k
 
         if exists(mask):
@@ -193,7 +193,7 @@ class CrossAttention(nn.Module):
         attn = sim.softmax(dim=-1)
         del sim
 
-        out = einsum('b i j, b j d -> b i d', attn, v)
+        out = torch.matmul(attn, v)
         del attn, v
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         del h
