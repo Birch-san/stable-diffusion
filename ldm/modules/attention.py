@@ -3,7 +3,9 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn, einsum
+from torchtyping import TensorType
 from einops import rearrange, repeat
+from typing import Optional
 
 from ldm.modules.diffusionmodules.util import checkpoint
 
@@ -148,14 +150,60 @@ class SpatialSelfAttention(nn.Module):
 
         return x+h_
 
+def l2norm(t):
+    return F.normalize(t, dim = -1)
+
+# original cosine sim attention
+# implementation by lucidrains
+# https://github.com/lucidrains/flash-cosine-sim-attention/blob/0c24b64bbcf8cb4c419579bfdcf39c5f4381d547/flash_cosine_sim_attention/flash_cosine_sim_attention.py#L39
+
+# b - batch
+# h - heads
+# i - src sequence length
+# j - target sequence length
+# d - feature dimension
+
+def plain_cosine_sim_attention(
+    q: TensorType['b', 'h', 'i', 'd'],
+    k: TensorType['b', 'h', 'j', 'd'],
+    v: TensorType['b', 'h', 'j', 'd'],
+    mask: Optional[TensorType['b', 'j']] = None,
+    attn_bias: Optional[TensorType['h', 'i', 'j']] = None,
+    scale = 8,
+    causal = False,
+    l2norm_qk = True
+
+) -> TensorType['b', 'h', 'i', 'd']:
+
+    if l2norm_qk:
+        q, k = map(l2norm, (q, k))
+
+    sim = einsum('... i d, ... j d -> ... i j', q, k)
+    sim = sim * scale
+
+    if exists(attn_bias):
+        sim = sim + attn_bias[None, ...]
+
+    mask_value = -torch.finfo(sim.dtype).max
+
+    if causal:
+        causal_mask = torch.ones(sim.shape[-2:], device = q.device, dtype = torch.bool).triu(1)
+        sim = sim.masked_fill(causal_mask, mask_value)
+
+    if exists(mask):
+        sim = sim.masked_fill(~mask[:, None, None, :], mask_value)
+
+    attn = sim.softmax(dim = -1)
+    return einsum('... i j, ... j d -> ... i d', attn, v)
 
 class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0., scale=8):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
-        self.scale = dim_head ** -0.5
+        # self.scale = dim_head ** -0.5
+        self.scale = scale
         self.heads = heads
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
@@ -177,27 +225,36 @@ class CrossAttention(nn.Module):
         v = self.to_v(context)
         del context
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        # q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        # use lucidrains' flash-cosine-sim-attention implementation
+        # https://github.com/lucidrains/flash-cosine-sim-attention/blob/0c24b64bbcf8cb4c419579bfdcf39c5f4381d547/flash_cosine_sim_attention/transformer.py#L75
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-        del q, k
+        o = plain_cosine_sim_attention(q, k, v, causal = True, scale = self.scale)
 
-        if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
-            del mask
+        o = rearrange(o, 'b h n d -> b n (h d)')
+        return self.to_out(o)
 
-        # attention, what we cannot get enough of
-        attn = sim.softmax(dim=-1)
-        del sim
 
-        out = einsum('b i j, b j d -> b i d', attn, v)
-        del attn, v
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        del h
-        return self.to_out(out)
+        # sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        # del q, k
+
+        # if exists(mask):
+        #     mask = rearrange(mask, 'b ... -> b (...)')
+        #     max_neg_value = -torch.finfo(sim.dtype).max
+        #     mask = repeat(mask, 'b j -> (b h) () j', h=h)
+        #     sim.masked_fill_(~mask, max_neg_value)
+        #     del mask
+
+        # # attention, what we cannot get enough of
+        # attn = sim.softmax(dim=-1)
+        # del sim
+
+        # out = einsum('b i j, b j d -> b i d', attn, v)
+        # del attn, v
+        # out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        # del h
+        # return self.to_out(out)
 
 
 class BasicTransformerBlock(nn.Module):
