@@ -8,7 +8,7 @@ from PIL import Image
 from PIL.Image import Resampling
 from tqdm import tqdm, trange
 # from imwatermark import WatermarkEncoder
-from itertools import islice, repeat as repeat_
+from itertools import islice, repeat as repeat_, chain
 from einops import rearrange, repeat
 from torchvision.utils import make_grid
 import time
@@ -333,7 +333,8 @@ def main():
         "--prompt",
         type=str,
         nargs="+",
-        default="a painting of a virus monster playing guitar",
+        action='append',
+        default=[],
         help="the prompt to render. you can express your prompt as '0.5:piano villain' to halve its effect. negative numbers accepted. try multiple prompts with differing weights. --scale can be used to further amplify the difference between your summed prompts and the unconditional prompt."
     )
     parser.add_argument(
@@ -585,13 +586,19 @@ def main():
                 ) for chunk_ in chunk(lines, batch_size)
             ]
     else:
-        prompt = opt.prompt
-        assert prompt is not None
-        batch_specs = repeat_(
-            EverySampleSamePromptSpec(
-                multiprompt=[parse_prompt(prompt) for prompt in opt.prompt]
-            ),
-            opt.n_iter
+        batch_specs = list(
+            chain(
+                *repeat_(
+                    [
+                        EverySampleSamePromptSpec(
+                            multiprompt=[
+                                parse_prompt(multiprompt_instance) for multiprompt_instance in multiprompt
+                            ]
+                        ) for multiprompt in opt.prompt
+                    ],
+                    opt.n_iter
+                )
+            )
         )
 
     sample_path = os.path.join(outpath, "samples")
