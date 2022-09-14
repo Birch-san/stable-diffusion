@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, einsum
 from einops import rearrange, repeat
+from opt_einsum import contract
 
 from ldm.modules.diffusionmodules.util import checkpoint
 
@@ -179,7 +180,7 @@ class CrossAttention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        sim = contract('b i d, b j d -> b i j', q, k) * self.scale
         del q, k
 
         if exists(mask):
@@ -193,7 +194,7 @@ class CrossAttention(nn.Module):
         attn = sim.softmax(dim=-1)
         del sim
 
-        out = einsum('b i j, b j d -> b i d', attn, v)
+        out = contract('b i j, b j d -> b i d', attn, v)
         del attn, v
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         del h
