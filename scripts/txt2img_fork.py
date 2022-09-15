@@ -338,6 +338,21 @@ def main():
         help="the prompt to render. you can express your prompt as '0.5:piano villain' to halve its effect. negative numbers accepted. try multiple prompts with differing weights. --scale can be used to further amplify the difference between your summed prompts and the unconditional prompt."
     )
     parser.add_argument(
+        "--prompt_interpolation_steps",
+        type=int,
+        nargs="?",
+        action='append',
+        default=None,
+        help="additionally emit samples of the latent walk between each supplied prompt. specifies the number of steps over which to perform the interpolation (e.g. how many samples to emit -- more steps = more gradual interpolation, more images produced)."
+    )
+    parser.add_argument(
+        "--prompt_interpolation_strategy",
+        type=str,
+        choices=["slerp", "lerp"],
+        default="slerp",
+        help="for latent walks (see --prompt_interpolation_steps): whether to use spherical or lineral interpolation between latent coordinates. spherical interpolation is more correct (see Kai Christensen's explanation in the text description of https://www.youtube.com/watch?v=nkliw2ue5ak)."
+    )
+    parser.add_argument(
         "--outdir",
         type=str,
         nargs="?",
