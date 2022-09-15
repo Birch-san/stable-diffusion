@@ -614,13 +614,16 @@ def main():
         with open(opt.from_file, "r") as f:
             lines = f.read().splitlines()
             batch_specs = [
-                VariedSamplesBatchSpec(
-                    # every line in the chunk is considered to be a single multiprompt.
-                    samples=list(SampleSpec(
-                        # splitting the line on tab, gives each prompt of the multiprompt.
-                        multiprompt=[parse_prompt(subprompt) for subprompt in multiprompt.split('\t')]
-                    ) for multiprompt in batch)
-                ) for batch in chunk(lines, batch_size)
+                VariedSamplesBatchSpec(samples=batch) for batch in chunk(
+                    (
+                        # every line in the file is considered to be a single multiprompt.
+                        SampleSpec(
+                            # splitting the line on tab, gives each prompt of the multiprompt.
+                            multiprompt=[parse_prompt(subprompt) for subprompt in line.split('\t')]
+                        ) for line in lines
+                    ),
+                    batch_size
+                )
             ]
     elif len(opt.prompt) == 1:
         # fast-path for the common case where just one prompt is provided
@@ -631,13 +634,14 @@ def main():
         )]
     else:
         batch_specs = [
-            VariedSamplesBatchSpec(
-                samples=list(
+            VariedSamplesBatchSpec(samples=batch) for batch in chunk(
+                (
                     SampleSpec(
                         multiprompt=[parse_prompt(subprompt) for subprompt in multiprompt]
-                    ) for multiprompt in batch
-                )
-            ) for batch in chunk(opt.prompt, batch_size)
+                    ) for multiprompt in opt.prompt
+                ),
+                batch_size
+            )
         ]
 
     sample_path = os.path.join(outpath, "samples")
