@@ -8,7 +8,7 @@ from PIL import Image
 from PIL.Image import Resampling
 from tqdm import tqdm, trange
 # from imwatermark import WatermarkEncoder
-from itertools import islice, repeat as repeat_, chain
+from itertools import islice, repeat as repeat_, chain, pairwise
 from einops import rearrange, repeat
 from torchvision.utils import make_grid
 import time
@@ -16,7 +16,7 @@ from pytorch_lightning import seed_everything
 from torch import autocast, nn
 from contextlib import contextmanager, nullcontext
 from random import randint
-from typing import Optional, Iterable, List, TypeAlias, Tuple
+from typing import Generic, Optional, Iterable, List, TypeAlias, Tuple, TypeVar, Callable, NamedTuple
 import re
 from ldm.models.diffusion.ddpm import LatentDiffusion
 import abc
@@ -100,6 +100,47 @@ def chunk(it, size):
     it = iter(it)
     return iter(lambda: tuple(islice(it, size)), ())
 
+T = TypeVar('T')
+
+@dataclass
+class InBetweenParams(Generic[T]):
+    from_: T
+    to: T
+    step: float
+
+MakeInbetween: TypeAlias = Callable[[InBetweenParams], T]
+
+def intersperse_linspace(
+    lst: List[T],
+    make_inbetween: MakeInbetween[T],
+    steps: Optional[int]
+) -> List[T]:
+    if steps is None:
+        return lst
+    return [
+        *chain(
+            *(
+                (
+                    pair[0],
+                    *(
+                        make_inbetween(
+                            InBetweenParams(
+                                from_=pair[0],
+                                to=pair[1],
+                                step=step
+                            )
+                        ) for step in np.linspace(
+                            start=1/steps,
+                            stop=1,
+                            num=steps-1,
+                            endpoint=False
+                        )
+                    )
+                ) for pair in pairwise(lst)
+            )
+        ),
+        lst[-1]
+    ]
 
 def numpy_to_pil(images):
     """
@@ -332,7 +373,7 @@ class LatentWalkSampleSpec(SampleSpec):
 SampleSpec.register(LatentWalkSampleSpec)
 
 @dataclass
-class IdenticalSamplesSameBatchSpec():
+class IdenticalSamplesBatchSpec():
     sample: SampleSpec
 
 @dataclass
@@ -341,7 +382,7 @@ class VariedSamplesBatchSpec():
 
 @dataclass
 class BatchSpec(abc.ABC): pass
-BatchSpec.register(IdenticalSamplesSameBatchSpec)
+BatchSpec.register(IdenticalSamplesBatchSpec)
 BatchSpec.register(VariedSamplesBatchSpec)
 
 def main():
@@ -361,7 +402,6 @@ def main():
         "--prompt_interpolation_steps",
         type=int,
         nargs="?",
-        action='append',
         default=None,
         help="additionally emit samples of the latent walk between each supplied prompt. specifies the number of steps over which to perform the interpolation (e.g. how many samples to emit -- more steps = more gradual interpolation, more images produced)."
     )
@@ -608,6 +648,13 @@ def main():
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
 
+    make_inbetween: MakeInbetween = lambda params: LatentWalkSampleSpec(
+        interp_quotient=params.step,
+        interp_strategy=opt.prompt_interpolation_strategy,
+        multiprompt=params.from_,
+        target_multiprompt=params.to
+    )
+
     batch_specs: Iterable[BatchSpec] = None
     if opt.from_file:
         print(f"reading prompts from {opt.from_file}")
@@ -615,19 +662,23 @@ def main():
             lines = f.read().splitlines()
             batch_specs = [
                 VariedSamplesBatchSpec(samples=batch) for batch in chunk(
-                    (
-                        # every line in the file is considered to be a single multiprompt.
-                        SampleSpec(
-                            # splitting the line on tab, gives each prompt of the multiprompt.
-                            multiprompt=[parse_prompt(subprompt) for subprompt in line.split('\t')]
-                        ) for line in lines
+                    intersperse_linspace(
+                        [
+                            # every line in the file is considered to be a single multiprompt.
+                            SampleSpec(
+                                # splitting the line on tab, gives each prompt of the multiprompt.
+                                multiprompt=[parse_prompt(subprompt) for subprompt in line.split('\t')]
+                            ) for line in lines
+                        ],
+                        make_inbetween=make_inbetween,
+                        steps=opt.prompt_interpolation_steps
                     ),
                     batch_size
                 )
             ]
     elif len(opt.prompt) == 1:
         # fast-path for the common case where just one prompt is provided
-        batch_specs = [IdenticalSamplesSameBatchSpec(
+        batch_specs = [IdenticalSamplesBatchSpec(
             sample = SampleSpec(
                 multiprompt=[parse_prompt(subprompt) for subprompt in opt.prompt[0]]
             )
@@ -635,10 +686,14 @@ def main():
     else:
         batch_specs = [
             VariedSamplesBatchSpec(samples=batch) for batch in chunk(
-                (
-                    SampleSpec(
-                        multiprompt=[parse_prompt(subprompt) for subprompt in multiprompt]
-                    ) for multiprompt in opt.prompt
+                intersperse_linspace(
+                    [
+                        SampleSpec(
+                            multiprompt=[parse_prompt(subprompt) for subprompt in multiprompt]
+                        ) for multiprompt in opt.prompt
+                    ],
+                    make_inbetween=make_inbetween,
+                    steps=opt.prompt_interpolation_steps
                 ),
                 batch_size
             )
@@ -737,7 +792,7 @@ def main():
                     for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch"):
                         if c is None or prompts_change_each_batch:
                             match batch_spec:
-                                case IdenticalSamplesSameBatchSpec(sample):
+                                case IdenticalSamplesBatchSpec(sample):
                                     # for some reason Python isn't narrowing the type automatically
                                     sample: SampleSpec = sample
                                     texts: List[str] = [subprompt.text for subprompt in sample.multiprompt]
