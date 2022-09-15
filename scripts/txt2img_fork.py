@@ -21,6 +21,7 @@ import re
 from ldm.models.diffusion.ddpm import LatentDiffusion
 import abc
 from dataclasses import dataclass
+from enum import Enum
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -298,31 +299,50 @@ def load_img(path):
 
 @dataclass
 class WeightedPrompt():
-    caption: str
+    text: str
     weight: float
 
 def parse_prompt(prompt: str) -> WeightedPrompt:
     match = re.search(r"^-?\d+(\.\d*)?:", prompt)
     if match is None:
-        return WeightedPrompt(caption=prompt, weight=1.0)
+        return WeightedPrompt(text=prompt, weight=1.0)
     group = match.group()[:-1]
     weight = float(group)
-    return WeightedPrompt(caption=prompt[len(group)+1:], weight=weight)
+    return WeightedPrompt(text=prompt[len(group)+1:], weight=weight)
 
 MultiPrompt: TypeAlias = Iterable[WeightedPrompt]
 
 @dataclass
-class EverySampleSamePromptSpec():
+class SampleSpec(abc.ABC):
     multiprompt: MultiPrompt
 
+# https://stackoverflow.com/a/73107990/5257399
+class InterpStrategy(str, Enum):
+    Slerp = 'slerp'
+    Lerp = 'lerp'
+
+    def __str__(self) -> str:
+        return self.value
+
 @dataclass
-class EverySampleDifferentPromptSpec():
-    multiprompts: List[MultiPrompt]
+class LatentWalkSampleSpec(SampleSpec):
+    target_multiprompt: MultiPrompt
+    interp_quotient: float
+    interp_strategy: InterpStrategy
+SampleSpec.register(LatentWalkSampleSpec)
+
+@dataclass
+class IdenticalSamplesSameBatchSpec():
+    sample: SampleSpec
+
+@dataclass
+class VariedSamplesBatchSpec():
+    samples: List[SampleSpec]
 
 @dataclass
 class BatchSpec(abc.ABC): pass
-BatchSpec.register(EverySampleSamePromptSpec)
-BatchSpec.register(EverySampleDifferentPromptSpec)
+BatchSpec.register(IdenticalSamplesSameBatchSpec)
+BatchSpec.register(VariedSamplesBatchSpec)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -348,8 +368,8 @@ def main():
     parser.add_argument(
         "--prompt_interpolation_strategy",
         type=str,
-        choices=["slerp", "lerp"],
-        default="slerp",
+        choices=[InterpStrategy.Slerp, InterpStrategy.Lerp],
+        default=InterpStrategy.Slerp,
         help="for latent walks (see --prompt_interpolation_steps): whether to use spherical or lineral interpolation between latent coordinates. spherical interpolation is more correct (see Kai Christensen's explanation in the text description of https://www.youtube.com/watch?v=nkliw2ue5ak)."
     )
     parser.add_argument(
@@ -594,21 +614,29 @@ def main():
         with open(opt.from_file, "r") as f:
             lines = f.read().splitlines()
             batch_specs = [
-                EverySampleDifferentPromptSpec(
+                VariedSamplesBatchSpec(
                     # every line in the chunk is considered to be a single multiprompt.
-                    # splitting the line on tab, gives each prompt of the multiprompt.
-                    multiprompts=list([parse_prompt(subprompt) for subprompt in multiprompt.split('\t')] for multiprompt in batch)
+                    samples=list(SampleSpec(
+                        # splitting the line on tab, gives each prompt of the multiprompt.
+                        multiprompt=[parse_prompt(subprompt) for subprompt in multiprompt.split('\t')]
+                    ) for multiprompt in batch)
                 ) for batch in chunk(lines, batch_size)
             ]
     elif len(opt.prompt) == 1:
         # fast-path for the common case where just one prompt is provided
-        batch_specs = [EverySampleSamePromptSpec(
-            multiprompt=[parse_prompt(subprompt) for subprompt in opt.prompt[0]]
+        batch_specs = [IdenticalSamplesSameBatchSpec(
+            sample = SampleSpec(
+                multiprompt=[parse_prompt(subprompt) for subprompt in opt.prompt[0]]
+            )
         )]
     else:
         batch_specs = [
-            EverySampleDifferentPromptSpec(
-                multiprompts=list([parse_prompt(subprompt) for subprompt in multiprompt] for multiprompt in batch)
+            VariedSamplesBatchSpec(
+                samples=list(
+                    SampleSpec(
+                        multiprompt=[parse_prompt(subprompt) for subprompt in multiprompt]
+                    ) for multiprompt in batch
+                )
             ) for batch in chunk(opt.prompt, batch_size)
         ]
 
@@ -705,19 +733,23 @@ def main():
                     for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch"):
                         if c is None or prompts_change_each_batch:
                             match batch_spec:
-                                case EverySampleSamePromptSpec(multiprompt):
-                                    captions: List[str] = [subprompt.caption for subprompt in multiprompt]
-                                    cond_arities: Tuple[int, ...] = (len(captions),) * batch_size
-                                    cond_weights: List[float] = [subprompt.weight for subprompt in multiprompt] * batch_size
-                                    p = model.get_learned_conditioning(captions)
+                                case IdenticalSamplesSameBatchSpec(sample):
+                                    # for some reason Python isn't narrowing the type automatically
+                                    sample: SampleSpec = sample
+                                    texts: List[str] = [subprompt.text for subprompt in sample.multiprompt]
+                                    cond_arities: Tuple[int, ...] = (len(texts),) * batch_size
+                                    cond_weights: List[float] = [subprompt.weight for subprompt in sample.multiprompt] * batch_size
+                                    p = model.get_learned_conditioning(texts)
                                     c = repeat_along_dim_0(p, batch_size)
                                     del p
-                                case EverySampleDifferentPromptSpec(multiprompts):
-                                    assert len(multiprompts) == batch_size
-                                    captions: List[str] = [subprompt.caption for multiprompt in multiprompts for subprompt in multiprompt]
-                                    cond_weights: List[float] = [subprompt.weight for multiprompt in multiprompts for subprompt in multiprompt]
-                                    cond_arities: List[int] = [len(multiprompt) for multiprompt in multiprompts]
-                                    c = model.get_learned_conditioning(captions)
+                                case VariedSamplesBatchSpec(samples):
+                                    # for some reason Python isn't narrowing the type automatically
+                                    samples: List[SampleSpec] = samples
+                                    assert len(samples) == batch_size
+                                    texts: List[str] = [subprompt.text for sample in samples for subprompt in sample.multiprompt]
+                                    cond_weights: List[float] = [subprompt.weight for sample in samples for subprompt in sample.multiprompt]
+                                    cond_arities: List[int] = [len(sample.multiprompt) for sample in samples]
+                                    c = model.get_learned_conditioning(texts)
                                 case _:
                                     raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
 
