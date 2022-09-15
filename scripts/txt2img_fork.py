@@ -298,16 +298,16 @@ def load_img(path):
 
 @dataclass
 class WeightedPrompt():
-    prompt: str
+    caption: str
     weight: float
 
 def parse_prompt(prompt: str) -> WeightedPrompt:
     match = re.search(r"^-?\d+(\.\d*)?:", prompt)
     if match is None:
-        return WeightedPrompt(prompt=prompt, weight=1.0)
+        return WeightedPrompt(caption=prompt, weight=1.0)
     group = match.group()[:-1]
     weight = float(group)
-    return WeightedPrompt(prompt=prompt[len(group)+1:], weight=weight)
+    return WeightedPrompt(caption=prompt[len(group)+1:], weight=weight)
 
 MultiPrompt: TypeAlias = Iterable[WeightedPrompt]
 
@@ -582,24 +582,20 @@ def main():
                 EverySampleDifferentPromptSpec(
                     # every line in the chunk is considered to be a single multiprompt.
                     # splitting the line on tab, gives each prompt of the multiprompt.
-                    multiprompts=list([parse_prompt(prompt) for prompt in line.split('\t')] for line in chunk_)
-                ) for chunk_ in chunk(lines, batch_size)
+                    multiprompts=list([parse_prompt(subprompt) for subprompt in multiprompt.split('\t')] for multiprompt in batch)
+                ) for batch in chunk(lines, batch_size)
             ]
+    elif len(opt.prompt) == 1:
+        # fast-path for the common case where just one prompt is provided
+        batch_specs = [EverySampleSamePromptSpec(
+            multiprompt=[parse_prompt(subprompt) for subprompt in opt.prompt[0]]
+        )]
     else:
-        batch_specs = list(
-            chain(
-                *repeat_(
-                    [
-                        EverySampleSamePromptSpec(
-                            multiprompt=[
-                                parse_prompt(multiprompt_instance) for multiprompt_instance in multiprompt
-                            ]
-                        ) for multiprompt in opt.prompt
-                    ],
-                    opt.n_iter
-                )
-            )
-        )
+        batch_specs = [
+            EverySampleDifferentPromptSpec(
+                multiprompts=list([parse_prompt(subprompt) for subprompt in multiprompt] for multiprompt in batch)
+            ) for batch in chunk(opt.prompt, batch_size)
+        ]
 
     sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)
@@ -689,24 +685,24 @@ def main():
                 c: Optional[FloatTensor] = None
                 cond_weights: Optional[Iterable[float]] = None
                 cond_arities: Optional[Iterable[int]] = None
-                for n in trange(opt.n_iter, desc="Batches"):
+                for n in trange(opt.n_iter, desc="Iterations"):
                     iter_tic = time.perf_counter()
-                    for batch_spec in tqdm(batch_specs, desc=f"Batch {n}, sample"):
+                    for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch"):
                         if c is None or prompts_change_each_batch:
                             match batch_spec:
                                 case EverySampleSamePromptSpec(multiprompt):
-                                    prompts: List[str] = [multiprompt_instance.prompt for multiprompt_instance in multiprompt]
-                                    cond_arities: Tuple[int, ...] = (len(prompts),) * batch_size
-                                    cond_weights: List[float] = [multiprompt_instance.weight for multiprompt_instance in multiprompt] * batch_size
-                                    p = model.get_learned_conditioning(prompts)
+                                    captions: List[str] = [subprompt.caption for subprompt in multiprompt]
+                                    cond_arities: Tuple[int, ...] = (len(captions),) * batch_size
+                                    cond_weights: List[float] = [subprompt.weight for subprompt in multiprompt] * batch_size
+                                    p = model.get_learned_conditioning(captions)
                                     c = repeat_along_dim_0(p, batch_size)
                                     del p
                                 case EverySampleDifferentPromptSpec(multiprompts):
                                     assert len(multiprompts) == batch_size
-                                    prompts: List[str] = [multiprompt_instance.prompt for multiprompt in multiprompts for multiprompt_instance in multiprompt]
-                                    cond_weights: List[float] = [multiprompt_instance.weight for multiprompt in multiprompts for multiprompt_instance in multiprompt]
+                                    captions: List[str] = [subprompt.caption for multiprompt in multiprompts for subprompt in multiprompt]
+                                    cond_weights: List[float] = [subprompt.weight for multiprompt in multiprompts for subprompt in multiprompt]
                                     cond_arities: List[int] = [len(multiprompt) for multiprompt in multiprompts]
-                                    c = model.get_learned_conditioning(prompts)
+                                    c = model.get_learned_conditioning(captions)
                                 case _:
                                     raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
 
