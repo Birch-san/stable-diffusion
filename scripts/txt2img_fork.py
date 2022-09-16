@@ -16,7 +16,7 @@ from pytorch_lightning import seed_everything
 from torch import autocast, nn
 from contextlib import contextmanager, nullcontext
 from random import randint
-from typing import Generic, Optional, Iterable, List, TypeAlias, Tuple, TypeVar, Callable, NamedTuple
+from typing import Generic, Optional, Iterable, List, TypeAlias, Tuple, TypeVar, Callable
 import re
 from ldm.models.diffusion.ddpm import LatentDiffusion
 import abc
@@ -648,11 +648,11 @@ def main():
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
 
-    make_inbetween: MakeInbetween = lambda params: LatentWalkSampleSpec(
+    make_inbetween: MakeInbetween[SampleSpec] = lambda params: LatentWalkSampleSpec(
         interp_quotient=params.step,
         interp_strategy=opt.prompt_interpolation_strategy,
-        multiprompt=params.from_,
-        target_multiprompt=params.to
+        multiprompt=params.from_.multiprompt,
+        target_multiprompt=params.to.multiprompt
     )
 
     batch_specs: Iterable[BatchSpec] = None
