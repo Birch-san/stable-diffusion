@@ -97,7 +97,7 @@ class DDIMSampler(object):
         # sampling
         C, H, W = shape
         size = (batch_size, C, H, W)
-        print(f'Data shape for DDIM sampling is {size}, eta {eta}')
+        # print(f'Data shape for DDIM sampling is {size}, eta {eta}')
 
         samples, intermediates = self.ddim_sampling(conditioning, size,
                                                     callback=callback,
@@ -142,9 +142,9 @@ class DDIMSampler(object):
         intermediates = {'x_inter': [img], 'pred_x0': [img]}
         time_range = reversed(range(0,timesteps)) if ddim_use_original_steps else np.flip(timesteps)
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
-        print(f"Running DDIM Sampling with {total_steps} timesteps")
+        # print(f"Running DDIM Sampling with {total_steps} timesteps")
 
-        iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+        iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps, disable=True)
 
         for i, step in enumerate(iterator):
             index = total_steps - i - 1
@@ -183,7 +183,14 @@ class DDIMSampler(object):
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
             c_in = torch.cat([unconditional_conditioning, c])
+            if t.item() == 997:
+                print(f"x_in: {hash(x_in.cpu().detach().numpy().tobytes())}")
+                print(f"c_in: {hash(c_in.cpu().detach().numpy().tobytes())}")
             e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
+            # first timestep that's sampled. sigma_max... ish.
+            if t.item() == 997:
+                print(f"e_t_uncond: {hash(e_t_uncond.cpu().detach().numpy().tobytes())}")
+                print(f"e_t: {hash(e_t.cpu().detach().numpy().tobytes())}")
             e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
 
         if score_corrector is not None:

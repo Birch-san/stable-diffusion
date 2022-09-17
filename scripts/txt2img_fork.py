@@ -388,7 +388,8 @@ BatchSpec.register(VariedSamplesBatchSpec)
 def main():
     parser = argparse.ArgumentParser()
 
-    proposed_seed = randint(np.iinfo(np.uint32).min, np.iinfo(np.uint32).max)
+    # proposed_seed = randint(np.iinfo(np.uint32).min, np.iinfo(np.uint32).max)
+    proposed_seed = 42
 
     parser.add_argument(
         "--prompt",
@@ -618,22 +619,23 @@ def main():
         opt.ckpt = "models/ldm/text2img-large/model.ckpt"
         opt.outdir = "outputs/txt2img-samples-laion400m"
 
-    seed_everything(opt.seed)
 
     config = OmegaConf.load(f"{opt.config}")
     model: LatentDiffusion = load_model_from_config(config, f"{opt.ckpt}")
 
+    seed_everything(opt.seed)
+
     device = torch.device(get_device())
     model = model.to(device)
 
-    if opt.sampler in K_DIFF_SAMPLERS:
-        model_k_wrapped = CompVisDenoiser(model, quantize=True)
-        model_k_guidance = KCFGDenoiser(model_k_wrapped)
-    elif opt.sampler in NOT_K_DIFF_SAMPLERS:
-        if opt.sampler == 'plms':
-            sampler = PLMSSampler(model)
-        else:
-            sampler = DDIMSampler(model)
+    # if opt.sampler in K_DIFF_SAMPLERS:
+    #     model_k_wrapped = CompVisDenoiser(model, quantize=True)
+    #     model_k_guidance = KCFGDenoiser(model_k_wrapped)
+    # elif opt.sampler in NOT_K_DIFF_SAMPLERS:
+    if opt.sampler == 'plms':
+        sampler = PLMSSampler(model)
+    else:
+        sampler = DDIMSampler(model)
     
 
     os.makedirs(opt.outdir, exist_ok=True)
@@ -704,10 +706,6 @@ def main():
     base_count = len(os.listdir(sample_path))
     grid_count = len(os.listdir(outpath)) - 1
 
-    shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-
-    start_code = None
-
     karras_noise_active = False
     end_karras_ramp_early_active = False
 
@@ -775,6 +773,16 @@ def main():
         init_latent = img_to_latent(opt.init_img)
     t_enc = int((1.0-opt.strength) * opt.steps)
 
+    start_code = None
+    # shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+    if opt.fixed_code:
+        shape = [opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f]
+        # rand_size = [opt.n_samples, *shape]
+        # https://github.com/CompVis/stable-diffusion/issues/25#issuecomment-1229706811
+        # MPS random is not currently deterministic w.r.t seed, so compute randn() on-CPU
+        start_code = torch.randn(shape, device='cpu').to(device) if device.type == 'mps' else torch.randn(shape, device=device)
+        seed_everything(opt.seed)
+
     precision_scope = autocast if opt.precision=="autocast" else nullcontext
     if device.type == 'mps':
         precision_scope = nullcontext # have to use f32 on mps
@@ -783,43 +791,51 @@ def main():
             with model.ema_scope():
                 tic = time.perf_counter()
                 all_samples = list()
-                uc = None if opt.scale == 1.0 else model.get_learned_conditioning("").expand(batch_size, -1, -1)
                 c: Optional[FloatTensor] = None
                 cond_weights: Optional[Iterable[float]] = None
                 cond_arities: Optional[Iterable[int]] = None
-                for n in trange(opt.n_iter, desc="Iterations"):
+                for n in trange(opt.n_iter, desc="Iterations", disable=True):
                     iter_tic = time.perf_counter()
-                    for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch"):
-                        if c is None or prompts_change_each_batch:
-                            match batch_spec:
-                                case IdenticalSamplesBatchSpec(sample):
-                                    # for some reason Python isn't narrowing the type automatically
-                                    sample: SampleSpec = sample
-                                    texts: List[str] = [subprompt.text for subprompt in sample.multiprompt]
-                                    cond_arities: Tuple[int, ...] = (len(texts),) * batch_size
-                                    cond_weights: List[float] = [subprompt.weight for subprompt in sample.multiprompt] * batch_size
-                                    p = model.get_learned_conditioning(texts)
-                                    c = repeat_along_dim_0(p, batch_size)
-                                    del p
-                                case VariedSamplesBatchSpec(samples):
-                                    # for some reason Python isn't narrowing the type automatically
-                                    samples: List[SampleSpec] = samples
-                                    assert len(samples) == batch_size
-                                    texts: List[str] = [subprompt.text for sample in samples for subprompt in sample.multiprompt]
-                                    cond_weights: List[float] = [subprompt.weight for sample in samples for subprompt in sample.multiprompt]
-                                    cond_arities: List[int] = [len(sample.multiprompt) for sample in samples]
-                                    c = model.get_learned_conditioning(texts)
-                                case _:
-                                    raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
+                    for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch", disable=True):
+                        uc = None if opt.scale == 1.0 else model.get_learned_conditioning("").expand(batch_size, -1, -1)
+                        # if c is None or prompts_change_each_batch:
+                        match batch_spec:
+                            case IdenticalSamplesBatchSpec(sample):
+                                # for some reason Python isn't narrowing the type automatically
+                                sample: SampleSpec = sample
+                                texts: List[str] = [subprompt.text for subprompt in sample.multiprompt]
+                                cond_arities: Tuple[int, ...] = (len(texts),) * batch_size
+                                cond_weights: List[float] = [subprompt.weight for subprompt in sample.multiprompt] * batch_size
+                                p = model.get_learned_conditioning(texts)
+                                # print(f"Iteration {n} p: {hash(p.cpu().detach().numpy().tobytes())}")
+                                c = repeat_along_dim_0(p, batch_size)
+                                del p
+                            case VariedSamplesBatchSpec(samples):
+                                # for some reason Python isn't narrowing the type automatically
+                                samples: List[SampleSpec] = samples
+                                assert len(samples) == batch_size
+                                texts: List[str] = [subprompt.text for sample in samples for subprompt in sample.multiprompt]
+                                cond_weights: List[float] = [subprompt.weight for sample in samples for subprompt in sample.multiprompt]
+                                cond_arities: List[int] = [len(sample.multiprompt) for sample in samples]
+                                c = model.get_learned_conditioning(texts)
+                            case _:
+                                raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
+                        # print(f"Iteration {n} uc: {hash(uc.cpu().detach().numpy().tobytes())}")
+                        # print(f"Iteration {n} c: {hash(c.cpu().detach().numpy().tobytes())}")
 
                         # if init_latent is None and (start_code is None or not opt.fixed_code):
-                        if start_code is None or not opt.fixed_code:
-                            rand_size = [opt.n_samples, *shape]
-                            # https://github.com/CompVis/stable-diffusion/issues/25#issuecomment-1229706811
-                            # MPS random is not currently deterministic w.r.t seed, so compute randn() on-CPU
-                            start_code = torch.randn(rand_size, device='cpu').to(device) if device.type == 'mps' else torch.randn(rand_size, device=device)
+                        # if not opt.fixed_code:
+                        #     rand_size = [opt.n_samples, *shape]
+                        #     # https://github.com/CompVis/stable-diffusion/issues/25#issuecomment-1229706811
+                        #     # MPS random is not currently deterministic w.r.t seed, so compute randn() on-CPU
+                        #     start_code = torch.randn(rand_size, device='cpu').to(device) if device.type == 'mps' else torch.randn(rand_size, device=device)
+                        
+                        
+                        # print(f"Iteration {n} start_code: {hash(start_code.cpu().detach().numpy().tobytes())}")
 
+                        shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
                         if opt.sampler in NOT_K_DIFF_SAMPLERS:
+                            # print(f"Using {opt.sampler} so x_T=start_code")
                             if opt.karras_noise:
                                 print(f"[WARN] You have requested --karras_noise, but Karras et al noise schedule is not implemented for {opt.sampler} sampler. Implemented only for {K_DIFF_SAMPLERS}. Using default noise schedule from DDIM.")
                             if init_latent is None:
@@ -924,6 +940,7 @@ def main():
                             x = start_code * sigmas[0] # for GPU draw
                             if init_latent is not None:
                                 x = init_latent + x
+                            print(f"Iteration {n} x: {hash(x.cpu().detach().numpy().tobytes())}")
                             extra_args = {
                                 'cond': c,
                                 'uncond': uc,
