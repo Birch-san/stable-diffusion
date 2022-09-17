@@ -2,7 +2,7 @@ from inspect import isfunction
 import math
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum
+from torch import nn, einsum, zeros_like
 from einops import rearrange, repeat
 
 from ldm.modules.diffusionmodules.util import checkpoint
@@ -167,6 +167,8 @@ class CrossAttention(nn.Module):
             nn.Dropout(dropout)
         )
 
+        self.mitigated_mps_nightly_bug = False
+
     def forward(self, x, context=None, mask=None):
         h = self.heads
 
@@ -178,6 +180,15 @@ class CrossAttention(nn.Module):
         del context
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+        if q.device.type == 'mps' and not self.mitigated_mps_nightly_bug:
+            # sacrificial einsum to ensure correctness for users of pytorch nightly
+            # https://github.com/pytorch/pytorch/issues/85224
+            t1 = zeros_like(q)
+            t2 = zeros_like(k)
+            einsum('b i d, b j d -> b i j', t1, t2)
+            del t1, t2
+            self.mitigated_mps_nightly_bug = True
 
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
         del q, k
