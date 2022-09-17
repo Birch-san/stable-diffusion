@@ -183,14 +183,14 @@ class DDIMSampler(object):
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
             c_in = torch.cat([unconditional_conditioning, c])
-            if t.item() == 997:
-                print(f"x_in: {hash(x_in.cpu().detach().numpy().tobytes())}")
-                print(f"c_in: {hash(c_in.cpu().detach().numpy().tobytes())}")
+            # if t.item() == 997:
+            print(f"x_in: {hash(x_in.cpu().detach().numpy().tobytes())}")
+            print(f"c_in: {hash(c_in.cpu().detach().numpy().tobytes())}")
             e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
             # first timestep that's sampled. sigma_max... ish.
-            if t.item() == 997:
-                print(f"e_t_uncond: {hash(e_t_uncond.cpu().detach().numpy().tobytes())}")
-                print(f"e_t: {hash(e_t.cpu().detach().numpy().tobytes())}")
+            # if t.item() == 997:
+            print(f"e_t_uncond: {hash(e_t_uncond.cpu().detach().numpy().tobytes())}")
+            print(f"e_t: {hash(e_t.cpu().detach().numpy().tobytes())}")
             e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
 
         if score_corrector is not None:

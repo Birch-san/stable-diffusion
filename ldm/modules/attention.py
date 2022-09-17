@@ -170,16 +170,27 @@ class CrossAttention(nn.Module):
     def forward(self, x, context=None, mask=None):
         h = self.heads
 
+        print(f"CrossAttention x: {hash(x.cpu().detach().numpy().tobytes())}")
         q = self.to_q(x)
+        print(f"CrossAttention q: {hash(q.cpu().detach().numpy().tobytes())}")
         context = default(context, x)
+        print(f"CrossAttention context: {hash(context.cpu().detach().numpy().tobytes())}")
         del x
         k = self.to_k(context)
+        print(f"CrossAttention k: {hash(k.cpu().detach().numpy().tobytes())}")
         v = self.to_v(context)
+        print(f"CrossAttention v: {hash(v.cpu().detach().numpy().tobytes())}")
         del context
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+        print(f"CrossAttention rearranged q: {hash(q.cpu().detach().numpy().tobytes())}")
+        print(f"CrossAttention rearranged k: {hash(k.cpu().detach().numpy().tobytes())}")
+        print(f"CrossAttention rearranged v: {hash(v.cpu().detach().numpy().tobytes())}")
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        e = einsum('b i d, b j d -> b i j', q, k)
+        print(f"CrossAttention e: {hash(e.cpu().detach().numpy().tobytes())}")
+        sim = e * self.scale
+        print(f"CrossAttention sim: {hash(sim.cpu().detach().numpy().tobytes())}")
         del q, k
 
         if exists(mask):
@@ -191,13 +202,18 @@ class CrossAttention(nn.Module):
 
         # attention, what we cannot get enough of
         attn = sim.softmax(dim=-1)
+        print(f"CrossAttention attn: {hash(attn.cpu().detach().numpy().tobytes())}")
         del sim
 
         out = einsum('b i j, b j d -> b i d', attn, v)
+        print(f"CrossAttention out: {hash(out.cpu().detach().numpy().tobytes())}")
         del attn, v
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        print(f"CrossAttention rearranged out: {hash(out.cpu().detach().numpy().tobytes())}")
         del h
-        return self.to_out(out)
+        o = self.to_out(out)
+        print(f"CrossAttention o: {hash(o.cpu().detach().numpy().tobytes())}")
+        return o
 
 
 class BasicTransformerBlock(nn.Module):
@@ -216,10 +232,28 @@ class BasicTransformerBlock(nn.Module):
         return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
 
     def _forward(self, x, context=None):
+        print(f"BasicTransformerBlock x: {hash(x.cpu().detach().numpy().tobytes())}")
+        print(f"BasicTransformerBlock context: {'None' if context is None else hash(context.cpu().detach().numpy().tobytes())}")
         x = x.contiguous() if x.device.type == 'mps' else x
-        x += self.attn1(self.norm1(x))
-        x += self.attn2(self.norm2(x), context=context)
-        x += self.ff(self.norm3(x))
+        print(f"BasicTransformerBlock x = x.contiguous(): {hash(x.cpu().detach().numpy().tobytes())}")
+        n = self.norm1(x)
+        print(f"BasicTransformerBlock n = self.norm1(x): {hash(n.cpu().detach().numpy().tobytes())}")
+        a = self.attn1(n)
+        print(f"BasicTransformerBlock a: {hash(a.cpu().detach().numpy().tobytes())}")
+        x += a
+        print(f"BasicTransformerBlock x += a 0: {hash(x.cpu().detach().numpy().tobytes())}")
+        n = self.norm2(x)
+        print(f"BasicTransformerBlock n = self.norm2(x): {hash(n.cpu().detach().numpy().tobytes())}")
+        a = self.attn2(n, context=context)
+        print(f"BasicTransformerBlock a = self.attn2(n, context=context): {hash(a.cpu().detach().numpy().tobytes())}")
+        x += a
+        print(f"BasicTransformerBlock x += a 1: {hash(x.cpu().detach().numpy().tobytes())}")
+        n = self.norm3(x)
+        print(f"BasicTransformerBlock n = self.norm3(x): {hash(n.cpu().detach().numpy().tobytes())}")
+        f = self.ff(n)
+        print(f"BasicTransformerBlock f = self.ff(n): {hash(f.cpu().detach().numpy().tobytes())}")
+        x += f
+        print(f"BasicTransformerBlock x += f: {hash(x.cpu().detach().numpy().tobytes())}")
         return x
 
 
@@ -259,11 +293,20 @@ class SpatialTransformer(nn.Module):
         # note: if no context is given, cross-attention defaults to self-attention
         b, c, h, w = x.shape
         x_in = x
+        print(f"SpatialTransformer x_in: {hash(x_in.cpu().detach().numpy().tobytes())}")
         x = self.norm(x)
+        print(f"SpatialTransformer x = self.norm(x): {hash(x.cpu().detach().numpy().tobytes())}")
         x = self.proj_in(x)
+        print(f"SpatialTransformer x = self.proj_in(x): {hash(x.cpu().detach().numpy().tobytes())}")
         x = rearrange(x, 'b c h w -> b (h w) c')
-        for block in self.transformer_blocks:
+        print(f"SpatialTransformer x = rearrange(x) 0: {hash(x.cpu().detach().numpy().tobytes())}")
+        for ix, block in enumerate(self.transformer_blocks):
             x = block(x, context=context)
+            print(f"SpatialTransformer x = transformer_block {ix}: {hash(x.cpu().detach().numpy().tobytes())}")
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+        print(f"SpatialTransformer x = rearrange(x) 1: {hash(x.cpu().detach().numpy().tobytes())}")
         x = self.proj_out(x)
-        return x + x_in
+        print(f"SpatialTransformer x = self.proj_out(x): {hash(x.cpu().detach().numpy().tobytes())}")
+        sum_ = x + x_in
+        print(f"SpatialTransformer sum_ = x + x_in: {hash(sum_.cpu().detach().numpy().tobytes())}")
+        return sum_

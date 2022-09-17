@@ -78,13 +78,14 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
 
     def forward(self, x, emb, context=None):
-        for layer in self:
+        for ix, layer in enumerate(self):
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer):
                 x = layer(x, context)
             else:
                 x = layer(x)
+            print(f"Layer {ix} x: {hash(x.cpu().detach().numpy().tobytes())}")
         return x
 
 
@@ -261,9 +262,14 @@ class ResBlock(TimestepBlock):
             h = in_conv(h)
         else:
             h = self.in_layers(x)
+            print(f"ResBlock h=self.in_layers(x): {hash(h.cpu().detach().numpy().tobytes())}")
         emb_out = self.emb_layers(emb).type(h.dtype)
+        print(f"ResBlock emb_out=self.emb_layers(emb): {hash(emb_out.cpu().detach().numpy().tobytes())}")
+        ix = 0
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
+            print(f"ResBlock emb_out dim add {ix}: {hash(emb_out.cpu().detach().numpy().tobytes())}")
+            ix += 1
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
             scale, shift = th.chunk(emb_out, 2, dim=1)
@@ -271,8 +277,14 @@ class ResBlock(TimestepBlock):
             h = out_rest(h)
         else:
             h = h + emb_out
+            print(f"ResBlock h = h + emb_out: {hash(h.cpu().detach().numpy().tobytes())}")
             h = self.out_layers(h)
-        return self.skip_connection(x) + h
+            print(f"ResBlock h = self.out_layers(h): {hash(h.cpu().detach().numpy().tobytes())}")
+        skip = self.skip_connection(x)
+        print(f"ResBlock skip: {hash(skip.cpu().detach().numpy().tobytes())}")
+        sum_ = skip + h
+        print(f"ResBlock sum: {hash(sum_.cpu().detach().numpy().tobytes())}")
+        return sum_
 
 
 class AttentionBlock(nn.Module):
@@ -727,14 +739,19 @@ class UNetModel(nn.Module):
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
 
+        print(f"emb: {hash(emb.cpu().detach().numpy().tobytes())}")
         h = x.type(self.dtype)
-        for module in self.input_blocks:
+        for ix, module in enumerate(self.input_blocks):
             h = module(h, emb, context)
+            print(f"Input block {ix} h: {hash(h.cpu().detach().numpy().tobytes())}")
             hs.append(h)
         h = self.middle_block(h, emb, context)
-        for module in self.output_blocks:
+        print(f"middle h: {hash(h.cpu().detach().numpy().tobytes())}")
+        for ix, module in enumerate(self.output_blocks):
             h = th.cat([h, hs.pop()], dim=1)
+            print(f"Output block {ix} catted h: {hash(h.cpu().detach().numpy().tobytes())}")
             h = module(h, emb, context)
+            print(f"Output block {ix} output h: {hash(h.cpu().detach().numpy().tobytes())}")
         h = h.type(x.dtype)
         if self.predict_codebook_ids:
             return self.id_predictor(h)
