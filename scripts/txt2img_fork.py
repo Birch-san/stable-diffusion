@@ -644,7 +644,6 @@ def main():
     # wm_encoder = WatermarkEncoder()
     # wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
 
-    prompts_change_each_batch = bool(opt.from_file)
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
 
@@ -655,6 +654,7 @@ def main():
         target_multiprompt=params.to.multiprompt
     )
 
+    prompts_change_each_batch = bool(opt.from_file) or len(opt.prompt) > 1
     batch_specs: Iterable[BatchSpec] = None
     if opt.from_file:
         print(f"reading prompts from {opt.from_file}")
