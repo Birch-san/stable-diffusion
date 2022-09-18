@@ -6,7 +6,7 @@ import numpy as np
 from einops import rearrange
 
 from ldm.util import instantiate_from_config
-from ldm.modules.attention import LinearAttention
+from ldm.modules.attention import LinearAttention, SpatialSelfAttention
 
 
 def get_timestep_embedding(timesteps, embedding_dim):
@@ -142,71 +142,16 @@ class ResnetBlock(nn.Module):
 
 
 class LinAttnBlock(LinearAttention):
-    """to match AttnBlock usage"""
+    """to match SpatialSelfAttention usage"""
     def __init__(self, in_channels):
         super().__init__(dim=in_channels, heads=1, dim_head=in_channels)
-
-
-class AttnBlock(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.in_channels = in_channels
-
-        self.norm = Normalize(in_channels)
-        self.q = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.k = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.v = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.proj_out = torch.nn.Conv2d(in_channels,
-                                        in_channels,
-                                        kernel_size=1,
-                                        stride=1,
-                                        padding=0)
-
-
-    def forward(self, x):
-        h_ = x
-        h_ = self.norm(h_)
-        q = self.q(h_)
-        k = self.k(h_)
-        v = self.v(h_)
-
-        # compute attention
-        b,c,h,w = q.shape
-        q = q.reshape(b,c,h*w)
-        q = q.permute(0,2,1)   # b,hw,c
-        k = k.reshape(b,c,h*w) # b,c,hw
-        w_ = torch.bmm(q,k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
-        w_ = w_ * (int(c)**(-0.5))
-        w_ = torch.nn.functional.softmax(w_, dim=2)
-
-        # attend to values
-        v = v.reshape(b,c,h*w)
-        w_ = w_.permute(0,2,1)   # b,hw,hw (first hw of k, second of q)
-        h_ = torch.bmm(v,w_)     # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
-        h_ = h_.reshape(b,c,h,w)
-
-        h_ = self.proj_out(h_)
-
-        return x+h_
 
 
 def make_attn(in_channels, attn_type="vanilla"):
     assert attn_type in ["vanilla", "linear", "none"], f'attn_type {attn_type} unknown'
     print(f"making attention of type '{attn_type}' with {in_channels} in_channels")
     if attn_type == "vanilla":
-        return AttnBlock(in_channels)
+        return SpatialSelfAttention(in_channels)
     elif attn_type == "none":
         return nn.Identity(in_channels)
     else:
@@ -666,7 +611,7 @@ class LatentRescaler(nn.Module):
                                                      out_channels=mid_channels,
                                                      temb_channels=0,
                                                      dropout=0.0) for _ in range(depth)])
-        self.attn = AttnBlock(mid_channels)
+        self.attn = SpatialSelfAttention(mid_channels)
         self.res_block2 = nn.ModuleList([ResnetBlock(in_channels=mid_channels,
                                                      out_channels=mid_channels,
                                                      temb_channels=0,
