@@ -389,8 +389,6 @@ BatchSpec.register(VariedSamplesBatchSpec)
 def main():
     parser = argparse.ArgumentParser()
 
-    proposed_seed = randint(np.iinfo(np.uint32).min, np.iinfo(np.uint32).max)
-
     parser.add_argument(
         "--prompt",
         type=str,
@@ -564,7 +562,8 @@ def main():
     parser.add_argument(
         "--seed",
         type=int,
-        default=proposed_seed,
+        nargs="?",
+        default=None,
         help="the seed (for reproducible sampling)",
     )
     parser.add_argument(
@@ -791,7 +790,7 @@ def main():
                     iter_tic = time.perf_counter()
                     for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch"):
                         if start_code is None or not opt.fixed_code:
-                            first_sample_of_batch_seed = opt.seed if opt.fixed_code else randint(np.iinfo(np.uint32).min, np.iinfo(np.uint32).max)
+                            first_sample_of_batch_seed = opt.seed if opt.seed is not None and (opt.fixed_code or start_code is None) else randint(np.iinfo(np.uint32).min, np.iinfo(np.uint32).max)
                             if opt.fixed_code_within_batch:
                                 sample_seeds: Iterable[int] = (first_sample_of_batch_seed,) * opt.n_samples
                                 seed_everything(first_sample_of_batch_seed)
