@@ -79,7 +79,7 @@ class KCFGDenoiser(nn.Module):
         # into:
         #   tensor([[[[0.5000]]],
         #           [[[0.1000]]]])
-        weight_tensor = (torch.tensor(cond_weights, device=uncond_out.device) * cond_scale).reshape(len(cond_weights), 1, 1, 1)
+        weight_tensor = (torch.tensor(cond_weights, device=uncond_out.device, dtype=unconds.dtype) * cond_scale).reshape(len(cond_weights), 1, 1, 1)
         deltas: Tensor = (conds_out-unconds) * weight_tensor
         del conds_out, unconds, weight_tensor
         cond = sum_along_slices_of_dim_0(deltas, arities=cond_arities)
@@ -359,18 +359,18 @@ class SampleSpec(abc.ABC):
 
 # https://stackoverflow.com/a/73107990/5257399
 class InterpStrategy(str, Enum):
-    Slerp = 'slerp'
-    Lerp = 'lerp'
+    CondDiff = 'cond_diff'
+    LatentSlerp = 'slerp'
+    LatentLerp = 'lerp'
 
     def __str__(self) -> str:
         return self.value
 
 @dataclass
-class LatentWalkSampleSpec(SampleSpec):
+class BetweenSampleSpec(SampleSpec):
     target_multiprompt: MultiPrompt
     interp_quotient: float
-    interp_strategy: InterpStrategy
-SampleSpec.register(LatentWalkSampleSpec)
+SampleSpec.register(BetweenSampleSpec)
 
 @dataclass
 class IdenticalSamplesBatchSpec():
@@ -403,14 +403,14 @@ def main():
         type=int,
         nargs="?",
         default=None,
-        help="additionally emit samples of the latent walk between each supplied prompt. specifies the number of steps over which to perform the interpolation (e.g. how many samples to emit -- more steps = more gradual interpolation, more images produced)."
+        help="additionally generates samples for a transition between each supplied prompt. specifies the number of steps over which to perform the interpolation (e.g. how many samples to emit -- more steps = more gradual interpolation, more images produced)."
     )
     parser.add_argument(
         "--prompt_interpolation_strategy",
         type=str,
-        choices=[InterpStrategy.Slerp, InterpStrategy.Lerp],
-        default=InterpStrategy.Slerp,
-        help="for latent walks (see --prompt_interpolation_steps): whether to use spherical or lineral interpolation between latent coordinates. spherical interpolation is more correct (see Kai Christensen's explanation in the text description of https://www.youtube.com/watch?v=nkliw2ue5ak)."
+        choices=[InterpStrategy.CondDiff, InterpStrategy.LatentSlerp, InterpStrategy.LatentLerp],
+        default=InterpStrategy.CondDiff,
+        help="how to interpolate between prompts (see --prompt_interpolation_steps). by default we use cond_diff, which at sampling-time conditions on both prompts to varying extents. [not yet implemented:] alternatively, you can find an embedding *between* the two prompts, and condition on just that one embedding (which is faster, and called a 'latent walk'). you can choose whether to use spherical or lineral interpolation when walking between latent coordinates. spherical interpolation is more correct (see Kai Christensen's explanation in the text description of https://www.youtube.com/watch?v=nkliw2ue5ak)."
     )
     parser.add_argument(
         "--outdir",
@@ -647,9 +647,8 @@ def main():
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
 
-    make_inbetween: MakeInbetween[SampleSpec] = lambda params: LatentWalkSampleSpec(
+    make_inbetween: MakeInbetween[SampleSpec] = lambda params: BetweenSampleSpec(
         interp_quotient=params.step,
-        interp_strategy=opt.prompt_interpolation_strategy,
         multiprompt=params.from_.multiprompt,
         target_multiprompt=params.to.multiprompt
     )
@@ -783,7 +782,7 @@ def main():
             with model.ema_scope():
                 tic = time.perf_counter()
                 all_samples = list()
-                uc = None if opt.scale == 1.0 else model.get_learned_conditioning("").expand(batch_size, -1, -1)
+                uc: Optional[FloatTensor] = None if opt.scale == 1.0 else model.get_learned_conditioning("").expand(batch_size, -1, -1)
                 c: Optional[FloatTensor] = None
                 cond_weights: Optional[Iterable[float]] = None
                 cond_arities: Optional[Iterable[int]] = None
@@ -805,9 +804,9 @@ def main():
                                     # for some reason Python isn't narrowing the type automatically
                                     samples: List[SampleSpec] = samples
                                     assert len(samples) == batch_size
-                                    texts: List[str] = [subprompt.text for sample in samples for subprompt in sample.multiprompt]
-                                    cond_weights: List[float] = [subprompt.weight for sample in samples for subprompt in sample.multiprompt]
-                                    cond_arities: List[int] = [len(sample.multiprompt) for sample in samples]
+                                    texts: List[str] = [subprompt.text for sample in samples for subprompt in ((*sample.multiprompt, *sample.target_multiprompt) if isinstance(sample, BetweenSampleSpec) else sample.multiprompt)]
+                                    cond_weights: List[float] = [interp_quotient*subprompt.weight for sample in samples for interp_quotient, multiprompt in (((1-sample.interp_quotient, sample.multiprompt), (sample.interp_quotient, sample.target_multiprompt)) if isinstance(sample, BetweenSampleSpec) else ((1., sample.multiprompt),)) for subprompt in multiprompt]
+                                    cond_arities: List[int] = [len(sample.multiprompt) + len(sample.target_multiprompt) if isinstance(sample, BetweenSampleSpec) else len(sample.multiprompt) for sample in samples]
                                     c = model.get_learned_conditioning(texts)
                                 case _:
                                     raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
