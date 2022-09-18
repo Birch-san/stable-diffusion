@@ -1,5 +1,6 @@
 import argparse, os, sys, glob
 import cv2
+from cv2 import randn
 import torch
 import numpy as np
 from torch import Tensor, FloatTensor
@@ -482,7 +483,12 @@ def main():
     parser.add_argument(
         "--fixed_code",
         action='store_true',
-        help="if enabled, uses the same starting code across samples ",
+        help="if enabled, uses the same starting code across iterations",
+    )
+    parser.add_argument(
+        "--fixed_code_within_batch",
+        action='store_true',
+        help="if enabled, uses the same starting code for each sample within a batch. useful when producing transitions in batches.",
     )
     parser.add_argument(
         "--ddim_eta",
@@ -618,8 +624,6 @@ def main():
         opt.ckpt = "models/ldm/text2img-large/model.ckpt"
         opt.outdir = "outputs/txt2img-samples-laion400m"
 
-    seed_everything(opt.seed)
-
     config = OmegaConf.load(f"{opt.config}")
     model: LatentDiffusion = load_model_from_config(config, f"{opt.ckpt}")
 
@@ -720,11 +724,10 @@ def main():
             return f'[{start}, …, {end}]'
         return f'[{", ".join(_format_sigma_pretty(sigma) for sigma in sigmas)}]'
 
-    def _compute_common_file_name_portion(sample_ix: str = '', sigmas: str = '') -> str:
-        seed = ''
+    def _compute_common_file_name_portion(seed: int, sigmas: str = '') -> str:
+        seed_ = ''
         sampling = ''
         prompt = ''
-        sample_ix_ = ''
         sigmas_ = ''
         guidance = ''
         if opt.filename_sampling:
@@ -732,34 +735,31 @@ def main():
             nz = '_ek' if end_karras_ramp_early_active else ''
             sampling = f"{opt.sampler}{opt.steps}{kna}{nz}"
         if opt.filename_seed:
-            seed = f".s{opt.seed}"
+            seed_ = f".s{seed}"
         if opt.filename_prompt:
-            sanitized = re.sub(r"[/\\?%*:|\"<>\x7F\x00-\x1F]", "-", '_'.join(opt.prompt))
+            sanitized = re.sub(r"[/\\?%*:|\"<>\x7F\x00-\x1F]", "-", '_'.join(opt.prompt[0]))
             prompt = f"_{sanitized}_"
-        if opt.filename_sample_ix:
-            sample_ix_ = sample_ix
         if opt.filename_sigmas and sigmas is not None:
             sigmas_ = f"_{sigmas}_"
         if opt.filename_guidance:
             guidance = f"_str{opt.strength}_sca{opt.scale}"
-        nominal = f"{seed}{sample_ix_}{prompt}{sigmas_}{guidance}{sampling}"
+        nominal = f"{seed_}{prompt}{sigmas_}{guidance}{sampling}"
         # https://apple.stackexchange.com/a/86617/251820
         # macOS imposes a filename limit of ~255 chars
         # we already used up some on base_count and the file extension
         # shed the biggest parts if we must, so that saving doesn't go bang
         if len(nominal) > 245:
-            nominal = f"{seed}{sample_ix_}{prompt}{guidance}{sampling}"
+            nominal = f"{seed_}{prompt}{guidance}{sampling}"
         if len(nominal) > 245:
-            nominal = f"{seed}{sample_ix_}{guidance}{sampling}"
+            nominal = f"{seed_}{guidance}{sampling}"
         return nominal
 
     def compute_batch_file_name(sigmas: str = '') -> str:
-        common_file_name_portion = _compute_common_file_name_portion(sigmas=sigmas)
+        common_file_name_portion = _compute_common_file_name_portion(seed=opt.seed, sigmas=sigmas)
         return f"grid-{grid_count:04}{common_file_name_portion}.png"
 
-    def compute_sample_file_name(batch_ix: int, sample_ix_in_batch: int, sigmas: Optional[str] = None) -> str:
-        sample_ix=f".n{batch_ix}.i{sample_ix_in_batch}"
-        common_file_name_portion = _compute_common_file_name_portion(sample_ix=sample_ix, sigmas=sigmas)
+    def compute_sample_file_name(sample_seed: int, sigmas: Optional[str] = None) -> str:
+        common_file_name_portion = _compute_common_file_name_portion(seed=sample_seed, sigmas=sigmas)
         return f"{base_count:05}{common_file_name_portion}.png"
     
     def img_to_latent(path: str) -> Tensor:
@@ -786,9 +786,38 @@ def main():
                 c: Optional[FloatTensor] = None
                 cond_weights: Optional[Iterable[float]] = None
                 cond_arities: Optional[Iterable[int]] = None
+                sample_seeds: Optional[Iterable[int]] = None
                 for n in trange(opt.n_iter, desc="Iterations"):
                     iter_tic = time.perf_counter()
                     for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch"):
+                        if start_code is None or not opt.fixed_code:
+                            first_sample_of_batch_seed = opt.seed if opt.fixed_code else randint(np.iinfo(np.uint32).min, np.iinfo(np.uint32).max)
+                            if opt.fixed_code_within_batch:
+                                sample_seeds: Iterable[int] = (first_sample_of_batch_seed,) * opt.n_samples
+                                seed_everything(first_sample_of_batch_seed)
+                                # https://github.com/CompVis/stable-diffusion/issues/25#issuecomment-1229706811
+                                # MPS random is not currently deterministic w.r.t seed, so compute randn() on-CPU
+                                sample_start_code = torch.randn(shape, device='cpu').to(device) if device.type == 'mps' else torch.randn(shape, device=device)
+                                start_code = sample_start_code.unsqueeze(0).expand(opt.n_samples)
+                            else:
+                                if opt.n_samples == 1:
+                                    sample_seeds: Iterable[int] = (first_sample_of_batch_seed,)
+                                else:
+                                    sample_seeds: Iterable[int] = (first_sample_of_batch_seed,) + tuple(torch.randint(
+                                        low=np.iinfo(np.uint32).min,
+                                        high=np.iinfo(np.uint32).max,
+                                        dtype=torch.int64,
+                                        device='cpu',
+                                        size=(opt.n_samples-1,)
+                                    ).numpy())
+                                sample_start_codes = []
+                                for seed in sample_seeds:
+                                    seed_everything(seed)
+                                    # https://github.com/CompVis/stable-diffusion/issues/25#issuecomment-1229706811
+                                    # MPS random is not currently deterministic w.r.t seed, so compute randn() on-CPU
+                                    sample_start_codes.append(torch.randn(shape, device='cpu').to(device) if device.type == 'mps' else torch.randn(shape, device=device))
+                                start_code = torch.stack(sample_start_codes, dim=0)
+
                         if c is None or prompts_change_each_batch:
                             match batch_spec:
                                 case IdenticalSamplesBatchSpec(sample):
@@ -810,13 +839,6 @@ def main():
                                     c = model.get_learned_conditioning(texts)
                                 case _:
                                     raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
-
-                        # if init_latent is None and (start_code is None or not opt.fixed_code):
-                        if start_code is None or not opt.fixed_code:
-                            rand_size = [opt.n_samples, *shape]
-                            # https://github.com/CompVis/stable-diffusion/issues/25#issuecomment-1229706811
-                            # MPS random is not currently deterministic w.r.t seed, so compute randn() on-CPU
-                            start_code = torch.randn(rand_size, device='cpu').to(device) if device.type == 'mps' else torch.randn(rand_size, device=device)
 
                         if opt.sampler in NOT_K_DIFF_SAMPLERS:
                             if opt.karras_noise:
@@ -975,12 +997,12 @@ def main():
                         x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
                         if not opt.skip_save:
-                            for ix, x_sample in enumerate(x_checked_image_torch):
+                            for x_sample, sample_seed in zip(x_checked_image_torch, sample_seeds):
                                 x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
                                 img = Image.fromarray(x_sample.astype(np.uint8))
                                 # img = put_watermark(img, wm_encoder)
                                 preferred_sigmas = sigmas_quantized if sigmas_quantized is not None else sigmas
-                                img.save(os.path.join(sample_path, compute_sample_file_name(batch_ix=n, sample_ix_in_batch=ix, sigmas=format_sigmas_pretty(preferred_sigmas, summary=True) if preferred_sigmas is not None else None)))
+                                img.save(os.path.join(sample_path, compute_sample_file_name(sample_seed=sample_seed, sigmas=format_sigmas_pretty(preferred_sigmas, summary=True) if preferred_sigmas is not None else None)))
                                 base_count += 1
 
                         if not opt.skip_grid:
@@ -997,7 +1019,7 @@ def main():
                     grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
                     img = Image.fromarray(grid.astype(np.uint8))
                     # img = put_watermark(img, wm_encoder)
-                    img.save(os.path.join(outpath, compute_batch_file_name()))
+                    img.save(os.path.join(outpath, compute_batch_file_name(sigmas=format_sigmas_pretty(preferred_sigmas, summary=True))))
                     grid_count += 1
 
                 toc = time.perf_counter()
