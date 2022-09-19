@@ -117,7 +117,7 @@ class PersonalizedBase(Dataset):
 
         self.image_paths = [
             os.path.join(self.data_root, file_path)
-            for file_path in os.listdir(self.data_root)
+            for file_path in os.listdir(self.data_root) if file_path.endswith('.png') or file_path.endswith('.jpg')
         ]
 
         # self._length = len(self.image_paths)
