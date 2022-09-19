@@ -717,7 +717,9 @@ def main():
         return "%.4f" % sigma
 
     def format_sigmas_pretty(sigmas: Tensor, summary: bool = False) -> str:
-        if (summary and sigmas.size(dim=0) > 9):
+        if sigmas is None:
+            return '[]'
+        if summary and sigmas.size(dim=0) > 9:
             start = ", ".join(_format_sigma_pretty(sigma) for sigma in sigmas[0:4])
             end = ", ".join(_format_sigma_pretty(sigma) for sigma in sigmas[-4:])
             return f'[{start}, …, {end}]'
