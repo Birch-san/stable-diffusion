@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, einsum
 from einops import rearrange, repeat
+from torch.profiler import record_function
 
 from ldm.modules.diffusionmodules.util import checkpoint
 
@@ -168,36 +169,46 @@ class CrossAttention(nn.Module):
         )
 
     def forward(self, x, context=None, mask=None):
-        h = self.heads
+        with record_function("CrossAttention::forward"):
+            h = self.heads
 
-        q = self.to_q(x)
-        context = default(context, x)
-        del x
-        k = self.to_k(context)
-        v = self.to_v(context)
-        del context
+            with record_function("CrossAttention::forward::to_q"):
+                q = self.to_q(x)
+            context = default(context, x)
+            del x
+            with record_function("CrossAttention::forward::to_k"):
+                k = self.to_k(context)
+            with record_function("CrossAttention::forward::to_v"):
+                v = self.to_v(context)
+            del context
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+            with record_function("CrossAttention::forward::qkv rearrange"):
+                q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-        del q, k
+            with record_function("CrossAttention::forward::sim einsum"):
+                sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+            del q, k
 
-        if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
-            del mask
+            if exists(mask):
+                mask = rearrange(mask, 'b ... -> b (...)')
+                max_neg_value = -torch.finfo(sim.dtype).max
+                mask = repeat(mask, 'b j -> (b h) () j', h=h)
+                sim.masked_fill_(~mask, max_neg_value)
+                del mask
 
-        # attention, what we cannot get enough of
-        attn = sim.softmax(dim=-1)
-        del sim
+            # attention, what we cannot get enough of
+            with record_function("softmax"):
+                attn = sim.softmax(dim=-1)
+            del sim
 
-        out = einsum('b i j, b j d -> b i d', attn, v)
-        del attn, v
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        del h
-        return self.to_out(out)
+            with record_function("CrossAttention::forward::out einsum"):
+                out = einsum('b i j, b j d -> b i d', attn, v)
+            del attn, v
+            with record_function("CrossAttention::forward::out rearrange"):
+                out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+            del h
+            with record_function("CrossAttention::forward::to_out"):
+                return self.to_out(out)
 
 
 class BasicTransformerBlock(nn.Module):
@@ -256,14 +267,22 @@ class SpatialTransformer(nn.Module):
                                               padding=0))
 
     def forward(self, x, context=None):
-        # note: if no context is given, cross-attention defaults to self-attention
-        b, c, h, w = x.shape
-        x_in = x
-        x = self.norm(x)
-        x = self.proj_in(x)
-        x = rearrange(x, 'b c h w -> b (h w) c')
-        for block in self.transformer_blocks:
-            x = block(x, context=context)
-        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
-        x = self.proj_out(x)
-        return x + x_in
+        with record_function("SpatialTransformer::forward"):
+            # note: if no context is given, cross-attention defaults to self-attention
+            b, c, h, w = x.shape
+            x_in = x
+            with record_function("SpatialTransformer::forward::norm"):
+                x = self.norm(x)
+            with record_function("SpatialTransformer::forward::proj_in"):
+                x = self.proj_in(x)
+            with record_function("SpatialTransformer::forward::rearrange"):
+                x = rearrange(x, 'b c h w -> b (h w) c')
+            with record_function("SpatialTransformer::forward::for block in transformer_blocks"):
+                for block in self.transformer_blocks:
+                    with record_function("SpatialTransformer::forward::block()"):
+                        x = block(x, context=context)
+            with record_function("SpatialTransformer::forward::rearrange 2"):
+                x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+            with record_function("SpatialTransformer::forward::proj_out"):
+                x = self.proj_out(x)
+            return x + x_in

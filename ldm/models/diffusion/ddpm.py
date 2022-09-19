@@ -17,6 +17,7 @@ from functools import partial
 from tqdm import tqdm
 from torchvision.utils import make_grid
 from pytorch_lightning.utilities.distributed import rank_zero_only
+from torch.profiler import record_function
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
@@ -231,20 +232,24 @@ class DDPM(pl.LightningModule):
     def p_mean_variance(self, x, t, clip_denoised: bool):
         model_out = self.model(x, t)
         if self.parameterization == "eps":
-            x_recon = self.predict_start_from_noise(x, t=t, noise=model_out)
+            with record_function("predict_start_from_noise"):
+                x_recon = self.predict_start_from_noise(x, t=t, noise=model_out)
         elif self.parameterization == "x0":
             x_recon = model_out
         if clip_denoised:
             x_recon.clamp_(-1., 1.)
 
-        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
+        with record_function("q_posterior"):
+            model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.no_grad()
     def p_sample(self, x, t, clip_denoised=True, repeat_noise=False):
         b, *_, device = *x.shape, x.device
-        model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
-        noise = noise_like(x.shape, device, repeat_noise)
+        with record_function("p_mean_variance"):
+            model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
+        with record_function("noise_like"):
+            noise = noise_like(x.shape, device, repeat_noise)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
@@ -253,13 +258,16 @@ class DDPM(pl.LightningModule):
     def p_sample_loop(self, shape, return_intermediates=False):
         device = self.betas.device
         b = shape[0]
-        img = torch.randn(shape, device=device)
+        with record_function("img_randn"):
+            img = torch.randn(shape, device=device)
         intermediates = [img]
-        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='Sampling t', total=self.num_timesteps):
-            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long),
-                                clip_denoised=self.clip_denoised)
-            if i % self.log_every_t == 0 or i == self.num_timesteps - 1:
-                intermediates.append(img)
+        with record_function("p_sample_loop"):
+            for i in tqdm(reversed(range(0, self.num_timesteps)), desc='Sampling t', total=self.num_timesteps, disable=True):
+                with record_function("p_sample"):
+                    img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long),
+                                        clip_denoised=self.clip_denoised)
+                if i % self.log_every_t == 0 or i == self.num_timesteps - 1:
+                    intermediates.append(img)
         if return_intermediates:
             return img, intermediates
         return img
@@ -529,7 +537,7 @@ class LatentDiffusion(DDPM):
 
     def _get_denoise_row_from_list(self, samples, desc='', force_no_decoder_quantization=False):
         denoise_row = []
-        for zd in tqdm(samples, desc=desc):
+        for zd in tqdm(samples, desc=desc, disable=True):
             denoise_row.append(self.decode_first_stage(zd.to(self.device),
                                                             force_not_quantize=force_no_decoder_quantization))
         n_imgs_per_row = len(denoise_row)
@@ -984,7 +992,8 @@ class LatentDiffusion(DDPM):
             x_recon = fold(o) / normalization
 
         else:
-            x_recon = self.model(x_noisy, t, **cond)
+            with record_function("LatentDiffusion::apply_model::self.model()"):
+                x_recon = self.model(x_noisy, t, **cond)
 
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
@@ -1134,7 +1143,7 @@ class LatentDiffusion(DDPM):
         if start_T is not None:
             timesteps = min(timesteps, start_T)
         iterator = tqdm(reversed(range(0, timesteps)), desc='Progressive Generation',
-                        total=timesteps) if verbose else reversed(
+                        total=timesteps, disable=True) if verbose else reversed(
             range(0, timesteps))
         if type(temperature) == float:
             temperature = [temperature] * timesteps
@@ -1183,7 +1192,7 @@ class LatentDiffusion(DDPM):
 
         if start_T is not None:
             timesteps = min(timesteps, start_T)
-        iterator = tqdm(reversed(range(0, timesteps)), desc='Sampling t', total=timesteps) if verbose else reversed(
+        iterator = tqdm(reversed(range(0, timesteps)), desc='Sampling t', total=timesteps, disable=True) if verbose else reversed(
             range(0, timesteps))
 
         if mask is not None:
@@ -1400,25 +1409,27 @@ class DiffusionWrapper(pl.LightningModule):
         assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm']
 
     def forward(self, x, t, c_concat: list = None, c_crossattn: list = None):
-        if self.conditioning_key is None:
-            out = self.diffusion_model(x, t)
-        elif self.conditioning_key == 'concat':
-            xc = torch.cat([x] + c_concat, dim=1)
-            out = self.diffusion_model(xc, t)
-        elif self.conditioning_key == 'crossattn':
-            cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(x, t, context=cc)
-        elif self.conditioning_key == 'hybrid':
-            xc = torch.cat([x] + c_concat, dim=1)
-            cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(xc, t, context=cc)
-        elif self.conditioning_key == 'adm':
-            cc = c_crossattn[0]
-            out = self.diffusion_model(x, t, y=cc)
-        else:
-            raise NotImplementedError()
+        with record_function("DiffusionWrapper::forward"):
+            if self.conditioning_key is None:
+                out = self.diffusion_model(x, t)
+            elif self.conditioning_key == 'concat':
+                xc = torch.cat([x] + c_concat, dim=1)
+                out = self.diffusion_model(xc, t)
+            elif self.conditioning_key == 'crossattn':
+                cc = torch.cat(c_crossattn, 1)
+                with record_function("DiffusionWrapper::forward::out = self.diffusion_model()"):
+                    out = self.diffusion_model(x, t, context=cc)
+            elif self.conditioning_key == 'hybrid':
+                xc = torch.cat([x] + c_concat, dim=1)
+                cc = torch.cat(c_crossattn, 1)
+                out = self.diffusion_model(xc, t, context=cc)
+            elif self.conditioning_key == 'adm':
+                cc = c_crossattn[0]
+                out = self.diffusion_model(x, t, y=cc)
+            else:
+                raise NotImplementedError()
 
-        return out
+            return out
 
 
 class Layout2ImgDiffusion(LatentDiffusion):

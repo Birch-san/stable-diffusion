@@ -7,6 +7,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.profiler import record_function
 
 from ldm.modules.diffusionmodules.util import (
     checkpoint,
@@ -78,13 +79,17 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
 
     def forward(self, x, emb, context=None):
-        for layer in self:
-            if isinstance(layer, TimestepBlock):
-                x = layer(x, emb)
-            elif isinstance(layer, SpatialTransformer):
-                x = layer(x, context)
-            else:
-                x = layer(x)
+        with record_function("TimestepEmbedSequential::forward"):
+            for layer in self:
+                if isinstance(layer, TimestepBlock):
+                    with record_function("TimestepEmbedSequential::forward::TimestepBlock()"):
+                        x = layer(x, emb)
+                elif isinstance(layer, SpatialTransformer):
+                    with record_function("TimestepEmbedSequential::forward::SpatialTransformer()"):
+                        x = layer(x, context)
+                else:
+                    with record_function("TimestepEmbedSequential::forward::unknown()"):
+                        x = layer(x)
         return x
 
 
@@ -253,26 +258,31 @@ class ResBlock(TimestepBlock):
 
 
     def _forward(self, x, emb):
-        if self.updown:
-            in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
-            h = in_rest(x)
-            h = self.h_upd(h)
-            x = self.x_upd(x)
-            h = in_conv(h)
-        else:
-            h = self.in_layers(x)
-        emb_out = self.emb_layers(emb).type(h.dtype)
-        while len(emb_out.shape) < len(h.shape):
-            emb_out = emb_out[..., None]
-        if self.use_scale_shift_norm:
-            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
-            scale, shift = th.chunk(emb_out, 2, dim=1)
-            h = out_norm(h) * (1 + scale) + shift
-            h = out_rest(h)
-        else:
-            h = h + emb_out
-            h = self.out_layers(h)
-        return self.skip_connection(x) + h
+        with record_function("ResBlock::forward"):
+            if self.updown:
+                in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
+                h = in_rest(x)
+                h = self.h_upd(h)
+                x = self.x_upd(x)
+                h = in_conv(h)
+            else:
+                with record_function("ResBlock::forward::in_layers()"):
+                    h = self.in_layers(x)
+            with record_function("ResBlock::forward::self.emb_layers()"):
+                emb_out = self.emb_layers(emb).type(h.dtype)
+            while len(emb_out.shape) < len(h.shape):
+                emb_out = emb_out[..., None]
+            if self.use_scale_shift_norm:
+                out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+                scale, shift = th.chunk(emb_out, 2, dim=1)
+                h = out_norm(h) * (1 + scale) + shift
+                h = out_rest(h)
+            else:
+                h = h + emb_out
+                with record_function("ResBlock::forward::out_layers()"):
+                    h = self.out_layers(h)
+            with record_function("ResBlock::forward::self.skip_connection(x)+h"):
+                return self.skip_connection(x) + h
 
 
 class AttentionBlock(nn.Module):
@@ -716,30 +726,43 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        assert (y is not None) == (
-            self.num_classes is not None
-        ), "must specify y if and only if the model is class-conditional"
-        hs = []
-        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
-        emb = self.time_embed(t_emb)
+        with record_function("UNetModel::forward"):
+            assert (y is not None) == (
+                self.num_classes is not None
+            ), "must specify y if and only if the model is class-conditional"
+            hs = []
+            with record_function("UNetModel::forward::t_emb = timestep_embedding()"):
+                t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+            with record_function("UNetModel::forward::emb = self.time_embed()"):
+                emb = self.time_embed(t_emb)
 
-        if self.num_classes is not None:
-            assert y.shape == (x.shape[0],)
-            emb = emb + self.label_emb(y)
+            if self.num_classes is not None:
+                assert y.shape == (x.shape[0],)
+                emb = emb + self.label_emb(y)
 
-        h = x.type(self.dtype)
-        for module in self.input_blocks:
-            h = module(h, emb, context)
-            hs.append(h)
-        h = self.middle_block(h, emb, context)
-        for module in self.output_blocks:
-            h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, context)
-        h = h.type(x.dtype)
-        if self.predict_codebook_ids:
-            return self.id_predictor(h)
-        else:
-            return self.out(h)
+            h = x.type(self.dtype)
+            with record_function("UNetModel::forward::for module in self.input_blocks"):
+                for module in self.input_blocks:
+                    with record_function("UNetModel::forward::input_block"):
+                        with record_function("UNetModel::forward::input_block module()"):
+                            h = module(h, emb, context)
+                        with record_function("UNetModel::forward::input_block append()"):
+                            hs.append(h)
+            with record_function("UNetModel::forward::self.middle_block(h, emb, context)"):
+                h = self.middle_block(h, emb, context)
+            with record_function("UNetModel::forward::for module in self.output_blocks"):
+                for module in self.output_blocks:
+                    with record_function("UNetModel::forward::output_block"):
+                        with record_function("UNetModel::forward::output_block cat()"):
+                            h = th.cat([h, hs.pop()], dim=1)
+                        with record_function("UNetModel::forward::output_block module()"):
+                            h = module(h, emb, context)
+            h = h.type(x.dtype)
+            if self.predict_codebook_ids:
+                return self.id_predictor(h)
+            else:
+                with record_function("UNetModel::forward::self.out(h)"):
+                    return self.out(h)
 
 
 class EncoderUNetModel(nn.Module):

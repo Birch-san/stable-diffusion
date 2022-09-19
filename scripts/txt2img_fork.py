@@ -23,6 +23,7 @@ from ldm.models.diffusion.ddpm import LatentDiffusion
 import abc
 from dataclasses import dataclass
 from enum import Enum
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -62,30 +63,40 @@ class KCFGDenoiser(nn.Module):
         cond_arities: Iterable[int],
         cond_weights: Optional[Iterable[float]]
     ) -> Tensor:
-        uncond_count = uncond.size(dim=0)
-        cond_count = cond.size(dim=0)
-        cond_in = torch.cat((uncond, cond))
-        del uncond, cond
-        cond_arities_tensor = torch.tensor(cond_arities, device=cond_in.device)
-        x_in = cat_self_with_repeat_interleaved(t=x, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
-        del x
-        sigma_in = cat_self_with_repeat_interleaved(t=sigma, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
-        del sigma
-        uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in).split([uncond_count, cond_count])
-        del x_in, sigma_in, cond_in
-        unconds = repeat_interleave_along_dim_0(t=uncond_out, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
-        del cond_arities_tensor
-        # transform
-        #   tensor([0.5, 0.1])
-        # into:
-        #   tensor([[[[0.5000]]],
-        #           [[[0.1000]]]])
-        weight_tensor = (torch.tensor(cond_weights, device=uncond_out.device, dtype=unconds.dtype) * cond_scale).reshape(len(cond_weights), 1, 1, 1)
-        deltas: Tensor = (conds_out-unconds) * weight_tensor
-        del conds_out, unconds, weight_tensor
-        cond = sum_along_slices_of_dim_0(deltas, arities=cond_arities)
-        del deltas
-        return uncond_out + cond
+        with record_function("KCFGDenoiser::forward"):
+            uncond_count = uncond.size(dim=0)
+            cond_count = cond.size(dim=0)
+            with record_function("KCFGDenoiser::cond_in"):
+                cond_in = torch.cat((uncond, cond))
+            del uncond, cond
+            cond_arities_tensor = torch.tensor(cond_arities, device=cond_in.device)
+            with record_function("KCFGDenoiser::x_in"):
+                x_in = cat_self_with_repeat_interleaved(t=x, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
+            del x
+            with record_function("KCFGDenoiser::sigma_in"):
+                sigma_in = cat_self_with_repeat_interleaved(t=sigma, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
+            del sigma
+            with record_function("KCFGDenoiser::self.inner_model+split"):
+                uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in).split([uncond_count, cond_count])
+            del x_in, sigma_in, cond_in
+            with record_function("KCFGDenoiser::unconds"):
+                unconds = repeat_interleave_along_dim_0(t=uncond_out, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
+            del cond_arities_tensor
+            # transform
+            #   tensor([0.5, 0.1])
+            # into:
+            #   tensor([[[[0.5000]]],
+            #           [[[0.1000]]]])
+            with record_function("KCFGDenoiser::weight_tensor"):
+                weight_tensor = (torch.tensor(cond_weights, device=uncond_out.device, dtype=unconds.dtype) * cond_scale).reshape(len(cond_weights), 1, 1, 1)
+            with record_function("KCFGDenoiser::deltas"):
+                deltas: Tensor = (conds_out-unconds) * weight_tensor
+            del conds_out, unconds, weight_tensor
+            with record_function("KCFGDenoiser::self.cond"):
+                cond = sum_along_slices_of_dim_0(deltas, arities=cond_arities)
+            del deltas
+            with record_function("KCFGDenoiser::uncond_out + cond"):
+                return uncond_out + cond
 
 # from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 # from transformers import AutoFeatureExtractor
@@ -779,235 +790,248 @@ def main():
     with torch.no_grad():
         with precision_scope(device.type):
             with model.ema_scope():
-                tic = time.perf_counter()
-                all_samples = list()
-                uc: Optional[FloatTensor] = None if opt.scale == 1.0 else model.get_learned_conditioning("").expand(batch_size, -1, -1)
-                c: Optional[FloatTensor] = None
-                cond_weights: Optional[Iterable[float]] = None
-                cond_arities: Optional[Iterable[int]] = None
-                sample_seeds: Optional[Iterable[int]] = None
-                for n in trange(opt.n_iter, desc="Iterations"):
-                    iter_tic = time.perf_counter()
-                    for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch"):
-                        if start_code is None or not opt.fixed_code:
-                            first_sample_of_batch_seed = opt.seed if opt.seed is not None and (opt.fixed_code or start_code is None) else randint(np.iinfo(np.uint32).min, np.iinfo(np.uint32).max)
-                            if opt.fixed_code_within_batch:
-                                sample_seeds: Iterable[int] = (first_sample_of_batch_seed,) * opt.n_samples
-                                seed_everything(first_sample_of_batch_seed)
-                                # https://github.com/CompVis/stable-diffusion/issues/25#issuecomment-1229706811
-                                # MPS random is not currently deterministic w.r.t seed, so compute randn() on-CPU
-                                sample_start_code = torch.randn(shape, device='cpu').to(device) if device.type == 'mps' else torch.randn(shape, device=device)
-                                start_code = sample_start_code.unsqueeze(0).expand(opt.n_samples)
-                            else:
-                                if opt.n_samples == 1:
-                                    sample_seeds: Iterable[int] = (first_sample_of_batch_seed,)
-                                else:
-                                    sample_seeds: Iterable[int] = (first_sample_of_batch_seed,) + tuple(torch.randint(
-                                        low=np.iinfo(np.uint32).min,
-                                        high=np.iinfo(np.uint32).max,
-                                        dtype=torch.int64,
-                                        device='cpu',
-                                        size=(opt.n_samples-1,)
-                                    ).numpy())
-                                sample_start_codes = []
-                                for seed in sample_seeds:
-                                    seed_everything(seed)
-                                    # https://github.com/CompVis/stable-diffusion/issues/25#issuecomment-1229706811
-                                    # MPS random is not currently deterministic w.r.t seed, so compute randn() on-CPU
-                                    sample_start_codes.append(torch.randn(shape, device='cpu').to(device) if device.type == 'mps' else torch.randn(shape, device=device))
-                                start_code = torch.stack(sample_start_codes, dim=0)
+                with profile(activities=[ProfilerActivity.CPU], record_shapes=True, with_stack=True) as prof:
+                    with record_function("job"):
+                        tic = time.perf_counter()
+                        all_samples = list()
+                        with record_function("uc = model.get_learned_conditioning()"):
+                            uc: Optional[FloatTensor] = None if opt.scale == 1.0 else model.get_learned_conditioning("").expand(batch_size, -1, -1)
+                        c: Optional[FloatTensor] = None
+                        cond_weights: Optional[Iterable[float]] = None
+                        cond_arities: Optional[Iterable[int]] = None
+                        sample_seeds: Optional[Iterable[int]] = None
+                        for n in trange(opt.n_iter, desc="Iterations", disable=True):
+                            iter_tic = time.perf_counter()
+                            with record_function("iteration"):
+                                for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch", disable=True):
+                                    with record_function("batch"):
+                                        if start_code is None or not opt.fixed_code:
+                                            first_sample_of_batch_seed = opt.seed if opt.seed is not None and (opt.fixed_code or start_code is None) else randint(np.iinfo(np.uint32).min, np.iinfo(np.uint32).max)
+                                            if opt.fixed_code_within_batch:
+                                                sample_seeds: Iterable[int] = (first_sample_of_batch_seed,) * opt.n_samples
+                                                seed_everything(first_sample_of_batch_seed)
+                                                # https://github.com/CompVis/stable-diffusion/issues/25#issuecomment-1229706811
+                                                # MPS random is not currently deterministic w.r.t seed, so compute randn() on-CPU
+                                                sample_start_code = torch.randn(shape, device='cpu').to(device) if device.type == 'mps' else torch.randn(shape, device=device)
+                                                start_code = sample_start_code.unsqueeze(0).expand(opt.n_samples)
+                                            else:
+                                                if opt.n_samples == 1:
+                                                    sample_seeds: Iterable[int] = (first_sample_of_batch_seed,)
+                                                else:
+                                                    sample_seeds: Iterable[int] = (first_sample_of_batch_seed,) + tuple(torch.randint(
+                                                        low=np.iinfo(np.uint32).min,
+                                                        high=np.iinfo(np.uint32).max,
+                                                        dtype=torch.int64,
+                                                        device='cpu',
+                                                        size=(opt.n_samples-1,)
+                                                    ).numpy())
+                                                sample_start_codes = []
+                                                for seed in sample_seeds:
+                                                    seed_everything(seed)
+                                                    # https://github.com/CompVis/stable-diffusion/issues/25#issuecomment-1229706811
+                                                    # MPS random is not currently deterministic w.r.t seed, so compute randn() on-CPU
+                                                    sample_start_codes.append(torch.randn(shape, device='cpu').to(device) if device.type == 'mps' else torch.randn(shape, device=device))
+                                                start_code = torch.stack(sample_start_codes, dim=0)
 
-                        if c is None or prompts_change_each_batch:
-                            match batch_spec:
-                                case IdenticalSamplesBatchSpec(sample):
-                                    # for some reason Python isn't narrowing the type automatically
-                                    sample: SampleSpec = sample
-                                    texts: List[str] = [subprompt.text for subprompt in sample.multiprompt]
-                                    cond_arities: Tuple[int, ...] = (len(texts),) * batch_size
-                                    cond_weights: List[float] = [subprompt.weight for subprompt in sample.multiprompt] * batch_size
-                                    p = model.get_learned_conditioning(texts)
-                                    c = repeat_along_dim_0(p, batch_size)
-                                    del p
-                                case VariedSamplesBatchSpec(samples):
-                                    # for some reason Python isn't narrowing the type automatically
-                                    samples: List[SampleSpec] = samples
-                                    assert len(samples) == batch_size
-                                    texts: List[str] = [subprompt.text for sample in samples for subprompt in ((*sample.multiprompt, *sample.target_multiprompt) if isinstance(sample, BetweenSampleSpec) else sample.multiprompt)]
-                                    cond_weights: List[float] = [interp_quotient*subprompt.weight for sample in samples for interp_quotient, multiprompt in (((1-sample.interp_quotient, sample.multiprompt), (sample.interp_quotient, sample.target_multiprompt)) if isinstance(sample, BetweenSampleSpec) else ((1., sample.multiprompt),)) for subprompt in multiprompt]
-                                    cond_arities: List[int] = [len(sample.multiprompt) + len(sample.target_multiprompt) if isinstance(sample, BetweenSampleSpec) else len(sample.multiprompt) for sample in samples]
-                                    c = model.get_learned_conditioning(texts)
-                                case _:
-                                    raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
+                                        if c is None or prompts_change_each_batch:
+                                            match batch_spec:
+                                                case IdenticalSamplesBatchSpec(sample):
+                                                    # for some reason Python isn't narrowing the type automatically
+                                                    sample: SampleSpec = sample
+                                                    texts: List[str] = [subprompt.text for subprompt in sample.multiprompt]
+                                                    cond_arities: Tuple[int, ...] = (len(texts),) * batch_size
+                                                    cond_weights: List[float] = [subprompt.weight for subprompt in sample.multiprompt] * batch_size
+                                                    with record_function("c = model.get_learned_conditioning()"):
+                                                        p = model.get_learned_conditioning(texts)
+                                                        c = repeat_along_dim_0(p, batch_size)
+                                                    del p
+                                                case VariedSamplesBatchSpec(samples):
+                                                    # for some reason Python isn't narrowing the type automatically
+                                                    samples: List[SampleSpec] = samples
+                                                    assert len(samples) == batch_size
+                                                    texts: List[str] = [subprompt.text for sample in samples for subprompt in ((*sample.multiprompt, *sample.target_multiprompt) if isinstance(sample, BetweenSampleSpec) else sample.multiprompt)]
+                                                    cond_weights: List[float] = [interp_quotient*subprompt.weight for sample in samples for interp_quotient, multiprompt in (((1-sample.interp_quotient, sample.multiprompt), (sample.interp_quotient, sample.target_multiprompt)) if isinstance(sample, BetweenSampleSpec) else ((1., sample.multiprompt),)) for subprompt in multiprompt]
+                                                    cond_arities: List[int] = [len(sample.multiprompt) + len(sample.target_multiprompt) if isinstance(sample, BetweenSampleSpec) else len(sample.multiprompt) for sample in samples]
+                                                    with record_function("c = model.get_learned_conditioning()"):
+                                                        c = model.get_learned_conditioning(texts)
+                                                case _:
+                                                    raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
 
-                        if opt.sampler in NOT_K_DIFF_SAMPLERS:
-                            if opt.karras_noise:
-                                print(f"[WARN] You have requested --karras_noise, but Karras et al noise schedule is not implemented for {opt.sampler} sampler. Implemented only for {K_DIFF_SAMPLERS}. Using default noise schedule from DDIM.")
-                            if init_latent is None:
-                                samples, _ = sampler.sample(
-                                    S=opt.steps,
-                                    conditioning=c,
-                                    batch_size=opt.n_samples,
-                                    shape=shape,
-                                    verbose=False,
-                                    unconditional_guidance_scale=opt.scale,
-                                    unconditional_conditioning=uc,
-                                    eta=opt.ddim_eta,
-                                    x_T=start_code
-                                )
-                                # for PLMS and DDIM, sigmas are all 0
-                                sigmas = None
-                                sigmas_quantized = None
-                            else:
-                                z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
-                                samples = sampler.decode(
-                                    z_enc,
-                                    c,
-                                    t_enc,
-                                    unconditional_guidance_scale=opt.scale,
-                                    unconditional_conditioning=uc,
-                                )
-                        elif opt.sampler in K_DIFF_SAMPLERS:
-                            match opt.sampler:
-                                case 'dpm2':
-                                    sampling_fn = sample_dpm_2
-                                case 'dpm2_ancestral':
-                                    sampling_fn = sample_dpm_2_ancestral
-                                case 'heun':
-                                    sampling_fn = sample_heun
-                                case 'euler':
-                                    sampling_fn = sample_euler
-                                case 'euler_ancestral':
-                                    sampling_fn = sample_euler_ancestral
-                                case 'k_lms' | _:
-                                    sampling_fn = sample_lms
+                                        if opt.sampler in NOT_K_DIFF_SAMPLERS:
+                                            if opt.karras_noise:
+                                                print(f"[WARN] You have requested --karras_noise, but Karras et al noise schedule is not implemented for {opt.sampler} sampler. Implemented only for {K_DIFF_SAMPLERS}. Using default noise schedule from DDIM.")
+                                            if init_latent is None:
+                                                with record_function("legacy_sample"):
+                                                    samples, _ = sampler.sample(
+                                                        S=opt.steps,
+                                                        conditioning=c,
+                                                        batch_size=opt.n_samples,
+                                                        shape=shape,
+                                                        verbose=False,
+                                                        unconditional_guidance_scale=opt.scale,
+                                                        unconditional_conditioning=uc,
+                                                        eta=opt.ddim_eta,
+                                                        x_T=start_code
+                                                    )
+                                                # for PLMS and DDIM, sigmas are all 0
+                                                sigmas = None
+                                                sigmas_quantized = None
+                                            else:
+                                                z_enc = sampler.stochastic_encode(init_latent, torch.tensor([t_enc]*batch_size).to(device))
+                                                samples = sampler.decode(
+                                                    z_enc,
+                                                    c,
+                                                    t_enc,
+                                                    unconditional_guidance_scale=opt.scale,
+                                                    unconditional_conditioning=uc,
+                                                )
+                                        elif opt.sampler in K_DIFF_SAMPLERS:
+                                            match opt.sampler:
+                                                case 'dpm2':
+                                                    sampling_fn = sample_dpm_2
+                                                case 'dpm2_ancestral':
+                                                    sampling_fn = sample_dpm_2_ancestral
+                                                case 'heun':
+                                                    sampling_fn = sample_heun
+                                                case 'euler':
+                                                    sampling_fn = sample_euler
+                                                case 'euler_ancestral':
+                                                    sampling_fn = sample_euler_ancestral
+                                                case 'k_lms' | _:
+                                                    sampling_fn = sample_lms
 
-                            noise_schedule_sampler_args = {}
-                            # Karras sampling schedule achieves higher FID in fewer steps
-                            # https://arxiv.org/abs/2206.00364
-                            if opt.karras_noise:
-                                if opt.sampler not in KARRAS_SAMPLERS:
-                                    print(f"[WARN] you have enabled --karras_noise, but you are using it with a sampler ({opt.sampler}) outside of the ones proposed in the same paper (arXiv:2206.00364), {KARRAS_SAMPLERS}. No idea what results you'll get.")
-                                
-                                # the idea of "ending the Karras ramp early" (i.e. setting a high sigma_min) is that sigmas as lower as sigma_min
-                                # aren't very impactful, and every sigma counts when our step count is low
-                                # https://github.com/crowsonkb/k-diffusion/pull/23#issuecomment-1234872495
-                                # this is just a more performant way to get the "sigma before sigma_min" from a Karras schedule, aka
-                                # get_sigmas_karras(n=steps, sigma_max=sigma_max, sigma_min=sigma_min_nominal, rho=rho)[-3]
-                                def get_premature_sigma_min(
-                                    steps: int,
-                                    sigma_max: float,
-                                    sigma_min_nominal: float,
-                                    rho: float
-                                ) -> float:
-                                    min_inv_rho = sigma_min_nominal ** (1 / rho)
-                                    max_inv_rho = sigma_max ** (1 / rho)
-                                    ramp = (steps-2) * 1/(steps-1)
-                                    sigma_min = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
-                                    return sigma_min
+                                            noise_schedule_sampler_args = {}
+                                            # Karras sampling schedule achieves higher FID in fewer steps
+                                            # https://arxiv.org/abs/2206.00364
+                                            if opt.karras_noise:
+                                                if opt.sampler not in KARRAS_SAMPLERS:
+                                                    print(f"[WARN] you have enabled --karras_noise, but you are using it with a sampler ({opt.sampler}) outside of the ones proposed in the same paper (arXiv:2206.00364), {KARRAS_SAMPLERS}. No idea what results you'll get.")
+                                                
+                                                # the idea of "ending the Karras ramp early" (i.e. setting a high sigma_min) is that sigmas as lower as sigma_min
+                                                # aren't very impactful, and every sigma counts when our step count is low
+                                                # https://github.com/crowsonkb/k-diffusion/pull/23#issuecomment-1234872495
+                                                # this is just a more performant way to get the "sigma before sigma_min" from a Karras schedule, aka
+                                                # get_sigmas_karras(n=steps, sigma_max=sigma_max, sigma_min=sigma_min_nominal, rho=rho)[-3]
+                                                def get_premature_sigma_min(
+                                                    steps: int,
+                                                    sigma_max: float,
+                                                    sigma_min_nominal: float,
+                                                    rho: float
+                                                ) -> float:
+                                                    min_inv_rho = sigma_min_nominal ** (1 / rho)
+                                                    max_inv_rho = sigma_max ** (1 / rho)
+                                                    ramp = (steps-2) * 1/(steps-1)
+                                                    sigma_min = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+                                                    return sigma_min
 
-                                rho = 7.
-                                # 14.6146
-                                sigma_max=model_k_wrapped.sigmas[-1].item()
-                                # 0.0292
-                                sigma_min_nominal=model_k_wrapped.sigmas[0].item()
-                                # get the "sigma before sigma_min" from a slightly longer ramp
-                                # https://github.com/crowsonkb/k-diffusion/pull/23#issuecomment-1234872495
-                                premature_sigma_min = get_premature_sigma_min(
-                                    steps=opt.steps+1,
-                                    sigma_max=sigma_max,
-                                    sigma_min_nominal=sigma_min_nominal,
-                                    rho=rho
-                                )
-                                sigmas = get_sigmas_karras(
-                                    n=opt.steps,
-                                    sigma_min=premature_sigma_min if opt.end_karras_ramp_early else sigma_min_nominal,
-                                    sigma_max=sigma_max,
-                                    rho=rho,
-                                    device=device,
-                                )
-                                karras_noise_active = True
-                                end_karras_ramp_early_active = opt.end_karras_ramp_early
-                            else:
-                                if opt.sampler in KARRAS_SAMPLERS:
-                                    print(f"[WARN] you should really enable --karras_noise for best results; it's the noise schedule proposed in the same paper (arXiv:2206.00364) as the sampler you're using ({opt.sampler}). Falling back to default k-diffusion get_sigmas() noise schedule.")
-                                sigmas = model_k_wrapped.get_sigmas(opt.steps)
-                            
-                            if init_latent is not None:
-                                sigmas = sigmas[len(sigmas) - t_enc - 1 :]
-                            
-                            print('sigmas (before quantization):')
-                            print(format_sigmas_pretty(sigmas))
-                            print('sigmas (after quantization):')
-                            sigmas_quantized = append_zero(model_k_wrapped.sigmas[torch.argmin((sigmas[:-1].reshape(len(sigmas)-1, 1).repeat(1, len(model_k_wrapped.sigmas)) - model_k_wrapped.sigmas).abs(), dim=1)])
-                            print(format_sigmas_pretty(sigmas_quantized))
+                                                rho = 7.
+                                                # 14.6146
+                                                sigma_max=model_k_wrapped.sigmas[-1].item()
+                                                # 0.0292
+                                                sigma_min_nominal=model_k_wrapped.sigmas[0].item()
+                                                # get the "sigma before sigma_min" from a slightly longer ramp
+                                                # https://github.com/crowsonkb/k-diffusion/pull/23#issuecomment-1234872495
+                                                premature_sigma_min = get_premature_sigma_min(
+                                                    steps=opt.steps+1,
+                                                    sigma_max=sigma_max,
+                                                    sigma_min_nominal=sigma_min_nominal,
+                                                    rho=rho
+                                                )
+                                                with record_function("kdiff_get_sigmas_karras"):
+                                                    sigmas = get_sigmas_karras(
+                                                        n=opt.steps,
+                                                        sigma_min=premature_sigma_min if opt.end_karras_ramp_early else sigma_min_nominal,
+                                                        sigma_max=sigma_max,
+                                                        rho=rho,
+                                                        device=device,
+                                                    )
+                                                karras_noise_active = True
+                                                end_karras_ramp_early_active = opt.end_karras_ramp_early
+                                            else:
+                                                if opt.sampler in KARRAS_SAMPLERS:
+                                                    print(f"[WARN] you should really enable --karras_noise for best results; it's the noise schedule proposed in the same paper (arXiv:2206.00364) as the sampler you're using ({opt.sampler}). Falling back to default k-diffusion get_sigmas() noise schedule.")
+                                                with record_function("kdiff_get_sigmas"):
+                                                    sigmas = model_k_wrapped.get_sigmas(opt.steps)
+                                            
+                                            if init_latent is not None:
+                                                sigmas = sigmas[len(sigmas) - t_enc - 1 :]
+                                            
+                                            print('sigmas (before quantization):')
+                                            print(format_sigmas_pretty(sigmas))
+                                            print('sigmas (after quantization):')
+                                            sigmas_quantized = append_zero(model_k_wrapped.sigmas[torch.argmin((sigmas[:-1].reshape(len(sigmas)-1, 1).repeat(1, len(model_k_wrapped.sigmas)) - model_k_wrapped.sigmas).abs(), dim=1)])
+                                            print(format_sigmas_pretty(sigmas_quantized))
 
-                            x = start_code * sigmas[0] # for GPU draw
-                            if init_latent is not None:
-                                x = init_latent + x
-                            extra_args = {
-                                'cond': c,
-                                'uncond': uc,
-                                'cond_weights': cond_weights,
-                                'cond_arities': cond_arities,
-                                'cond_scale': opt.scale,
-                            }
-                            samples = sampling_fn(
-                                model_k_guidance,
-                                x,
-                                sigmas,
-                                extra_args=extra_args,
-                                **noise_schedule_sampler_args)
+                                            x = start_code * sigmas[0] # for GPU draw
+                                            if init_latent is not None:
+                                                x = init_latent + x
+                                            extra_args = {
+                                                'cond': c,
+                                                'uncond': uc,
+                                                'cond_weights': cond_weights,
+                                                'cond_arities': cond_arities,
+                                                'cond_scale': opt.scale,
+                                            }
+                                            with record_function("kdiff_sample"):
+                                                samples = sampling_fn(
+                                                    model_k_guidance,
+                                                    x,
+                                                    sigmas,
+                                                    extra_args=extra_args,
+                                                    disable=True,
+                                                    **noise_schedule_sampler_args)
 
-                        x_samples = model.decode_first_stage(samples)
+                                        with record_function("model.decode_first_stage"):
+                                            x_samples = model.decode_first_stage(samples)
 
-                        if opt.dynamic_thresholding:
-                            # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
-                            # adapted from lucidrains' imagen_pytorch (MIT-licensed)
-                            flattened = rearrange(x_samples, 'a b ... -> a b (...)').abs()
-                            # aten::sort.values_stable not implemented for MPS
-                            sort_on_cpu = device.type == 'mps'
-                            flattened = flattened.cpu() if sort_on_cpu else flattened
-                            # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
-                            s = torch.quantile(
-                                flattened,
-                                opt.dynamic_thresholding_percentile,
-                                dim = 2
-                            )
-                            s = s.to(device) if sort_on_cpu else s
-                            s.clamp_(min = 1.)
-                            s = right_pad_dims_to(x_samples, s)
-                            # MPS complains min and input tensors must be of the same shape
+                                        if opt.dynamic_thresholding:
+                                            # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
+                                            # adapted from lucidrains' imagen_pytorch (MIT-licensed)
+                                            flattened = rearrange(x_samples, 'a b ... -> a b (...)').abs()
+                                            # aten::sort.values_stable not implemented for MPS
+                                            sort_on_cpu = device.type == 'mps'
+                                            flattened = flattened.cpu() if sort_on_cpu else flattened
+                                            # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
+                                            s = torch.quantile(
+                                                flattened,
+                                                opt.dynamic_thresholding_percentile,
+                                                dim = 2
+                                            )
+                                            s = s.to(device) if sort_on_cpu else s
+                                            s.clamp_(min = 1.)
+                                            s = right_pad_dims_to(x_samples, s)
+                                            # MPS complains min and input tensors must be of the same shape
 
-                            clamp_tensors_on_cpu = device.type == 'mps'
-                            s_orig = s
-                            neg_s = -s
-                            s = s.cpu() if clamp_tensors_on_cpu else s
-                            neg_s = neg_s.cpu() if clamp_tensors_on_cpu else neg_s
-                            x_samples = x_samples.cpu() if clamp_tensors_on_cpu else x_samples
-                            x_samples = x_samples.clamp(neg_s, s)
-                            x_samples = x_samples.to(device) if clamp_tensors_on_cpu else x_samples
-                            x_samples = x_samples / s_orig
-                        
-                        x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
-                        x_samples = x_samples.cpu().permute(0, 2, 3, 1).numpy()
+                                            clamp_tensors_on_cpu = device.type == 'mps'
+                                            s_orig = s
+                                            neg_s = -s
+                                            s = s.cpu() if clamp_tensors_on_cpu else s
+                                            neg_s = neg_s.cpu() if clamp_tensors_on_cpu else neg_s
+                                            x_samples = x_samples.cpu() if clamp_tensors_on_cpu else x_samples
+                                            x_samples = x_samples.clamp(neg_s, s)
+                                            x_samples = x_samples.to(device) if clamp_tensors_on_cpu else x_samples
+                                            x_samples = x_samples / s_orig
+                                        
+                                        x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+                                        x_samples = x_samples.cpu().permute(0, 2, 3, 1).numpy()
 
-                        x_checked_image, has_nsfw_concept = check_safety_poorly(x_samples)
+                                        x_checked_image, has_nsfw_concept = check_safety_poorly(x_samples)
 
-                        x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+                                        x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
-                        if not opt.skip_save:
-                            for x_sample, sample_seed in zip(x_checked_image_torch, sample_seeds):
-                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                                img = Image.fromarray(x_sample.astype(np.uint8))
-                                # img = put_watermark(img, wm_encoder)
-                                preferred_sigmas = sigmas_quantized if sigmas_quantized is not None else sigmas
-                                img.save(os.path.join(sample_path, compute_sample_file_name(sample_seed=sample_seed, sigmas=format_sigmas_pretty(preferred_sigmas, summary=True) if preferred_sigmas is not None else None)))
-                                base_count += 1
+                                        if not opt.skip_save:
+                                            for x_sample, sample_seed in zip(x_checked_image_torch, sample_seeds):
+                                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                                                img = Image.fromarray(x_sample.astype(np.uint8))
+                                                # img = put_watermark(img, wm_encoder)
+                                                preferred_sigmas = sigmas_quantized if sigmas_quantized is not None else sigmas
+                                                img.save(os.path.join(sample_path, compute_sample_file_name(sample_seed=sample_seed, sigmas=format_sigmas_pretty(preferred_sigmas, summary=True) if preferred_sigmas is not None else None)))
+                                                base_count += 1
 
-                        if not opt.skip_grid:
-                            all_samples.append(x_checked_image_torch)
-                    iter_toc = time.perf_counter()
-                    print(f'batch {n} generated {batch_size} images in {iter_toc-iter_tic} seconds')
+                                        if not opt.skip_grid:
+                                            all_samples.append(x_checked_image_torch)
+                            iter_toc = time.perf_counter()
+                            print(f'iteration {n} generated {batch_size} images in {iter_toc-iter_tic} seconds')
                 if not opt.skip_grid:
                     # additionally, save as grid
                     grid = torch.stack(all_samples, 0)
@@ -1023,6 +1047,9 @@ def main():
 
                 toc = time.perf_counter()
                 print(f'in total, generated {opt.n_iter} batches of {batch_size} images in {toc-tic} seconds')
+                print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
+                # prof.export_chrome_trace("nightly.stack.json")
+                # prof.export_stacks("nightly.stacks2.txt", "self_cpu_time_total")
 
     print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
           f" \nEnjoy.")
