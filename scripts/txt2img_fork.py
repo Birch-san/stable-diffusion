@@ -6,7 +6,6 @@ import numpy as np
 from torch import Tensor, FloatTensor
 from omegaconf import OmegaConf
 from PIL import Image
-from PIL.Image import Resampling
 from tqdm import tqdm, trange
 # from imwatermark import WatermarkEncoder
 from itertools import islice, repeat as repeat_, chain, pairwise
@@ -333,7 +332,7 @@ def load_img(path):
     w, h = image.size
     print(f"loaded input image of size ({w}, {h}) from {path}")
     w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
-    image = image.resize((w, h), resample=Resampling.LANCZOS)
+    image = image.resize((w, h), resample=Image.LANCZOS)
     image = np.array(image).astype(np.float32) / 255.0
     image = image[None].transpose(0, 3, 1, 2)
     image = torch.from_numpy(image)
