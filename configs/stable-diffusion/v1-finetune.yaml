@@ -104,6 +104,7 @@ lightning:
         increase_log_steps: False
 
   trainer:
+    detect_anomaly: True
     benchmark: True
     max_steps: 4000000
 #    max_steps: 4000
