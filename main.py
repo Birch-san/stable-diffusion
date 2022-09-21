@@ -589,13 +589,14 @@ if __name__ == "__main__":
         if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             trainer_config['strategy'] = 'dp'
             trainer_config['accelerator'] = 'mps'
+            trainer_config['devices'] = 1
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
-        if not "gpus" in trainer_config:
+        if not "devices" in trainer_config:
             del trainer_config["accelerator"]
             cpu = True
         else:
-            gpuinfo = trainer_config["gpus"]
+            gpuinfo = trainer_config["devices"]
             print(f"Running on GPUs {gpuinfo}")
             cpu = False
         trainer_opt = argparse.Namespace(**trainer_config)
@@ -763,10 +764,10 @@ if __name__ == "__main__":
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
         if not cpu:
-            if isinstance(lightning_config.trainer.gpus, int):
-                ngpu = lightning_config.trainer.gpus
+            if isinstance(lightning_config.trainer.devices, int):
+                ngpu = lightning_config.trainer.devices
             else:
-                ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+                ngpu = len(lightning_config.trainer.devices.strip(",").split(','))
         else:
             ngpu = 1
         if 'accumulate_grad_batches' in lightning_config.trainer:
