@@ -179,7 +179,7 @@ class CrossAttention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q.detach(), k.detach()) * self.scale
+        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
         del q, k
 
         if exists(mask):
@@ -261,7 +261,7 @@ class SpatialTransformer(nn.Module):
         x_in = x
         x = self.norm(x)
         x = self.proj_in(x)
-        x = rearrange(x.detach(), 'b c h w -> b (h w) c')
+        x = rearrange(x, 'b c h w -> b (h w) c')
         for block in self.transformer_blocks:
             x = block(x, context=context)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
