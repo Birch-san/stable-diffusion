@@ -9,3 +9,4 @@ __pycache__/
 /src/k-diffusion/
 /*.png
 /*.pt
+/logs/
