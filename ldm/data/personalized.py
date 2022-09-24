@@ -6,7 +6,9 @@ from PIL.Image import Resampling
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-import random
+# import random
+
+template_fumo = 'photo of {} plush doll'
 
 imagenet_templates_smallest = [
     'a photo of a {}',
@@ -168,14 +170,15 @@ class PersonalizedBase(Dataset):
                 f'{self.coarse_class_text} {placeholder_string}'
             )
 
-        if self.per_image_tokens and np.random.uniform() < self.mixing_prob:
-            text = random.choice(imagenet_dual_templates_small).format(
-                placeholder_string, per_img_token_list[i % self.num_images]
-            )
-        else:
-            text = random.choice(imagenet_templates_small).format(
-                placeholder_string
-            )
+        # if self.per_image_tokens and np.random.uniform() < self.mixing_prob:
+        #     text = random.choice(imagenet_dual_templates_small).format(
+        #         placeholder_string, per_img_token_list[i % self.num_images]
+        #     )
+        # else:
+        #     text = random.choice(imagenet_templates_small).format(
+        #         placeholder_string
+        #     )
+        text = template_fumo.format(placeholder_string)
 
         example['caption'] = text
 
