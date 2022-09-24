@@ -2,6 +2,7 @@ import os
 import numpy as np
 import PIL
 from PIL import Image
+from PIL.Image import Resampling
 from torch.utils.data import Dataset
 from torchvision import transforms
 
@@ -142,10 +143,12 @@ class PersonalizedBase(Dataset):
 
         self.size = size
         self.interpolation = {
-            'linear': PIL.Image.LINEAR,
-            'bilinear': PIL.Image.BILINEAR,
-            'bicubic': PIL.Image.BICUBIC,
-            'lanczos': PIL.Image.LANCZOS,
+            # linear was deprecated
+            # https://pillow.readthedocs.io/en/stable/reference/Image.html#resampling-filters
+            'linear': Resampling.BILINEAR,
+            'bilinear': Resampling.BILINEAR,
+            'bicubic': Resampling.BICUBIC,
+            'lanczos': Resampling.LANCZOS,
         }[interpolation]
         self.flip = transforms.RandomHorizontalFlip(p=flip_p)
 
