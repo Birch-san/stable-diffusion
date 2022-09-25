@@ -21,30 +21,30 @@ from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
 
 def get_device():
-    if(torch.cuda.is_available()):
-        return 'cuda'
-    elif(torch.backends.mps.is_available()):
-        return 'mps'
-    else:
-        return 'cpu'
+    # if(torch.cuda.is_available()):
+    #     return 'cuda'
+    # elif(torch.backends.mps.is_available()):
+    #     return 'mps'
+    # else:
+    return 'cpu'
 
-def fix_func(orig):
-    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        def new_func(*args, **kw):
-            device = kw.get("device", "mps")
-            kw["device"]="cpu"
-            return orig(*args, **kw).to(device)
-        return new_func
-    return orig
+# def fix_func(orig):
+#     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+#         def new_func(*args, **kw):
+#             device = kw.get("device", "mps")
+#             kw["device"]="cpu"
+#             return orig(*args, **kw).to(device)
+#         return new_func
+#     return orig
 
-torch.rand = fix_func(torch.rand)
-torch.rand_like = fix_func(torch.rand_like)
-torch.randn = fix_func(torch.randn)
-torch.randn_like = fix_func(torch.randn_like)
-torch.randint = fix_func(torch.randint)
-torch.randint_like = fix_func(torch.randint_like)
-torch.bernoulli = fix_func(torch.bernoulli)
-torch.multinomial = fix_func(torch.multinomial)
+# torch.rand = fix_func(torch.rand)
+# torch.rand_like = fix_func(torch.rand_like)
+# torch.randn = fix_func(torch.randn)
+# torch.randn_like = fix_func(torch.randn_like)
+# torch.randint = fix_func(torch.randint)
+# torch.randint_like = fix_func(torch.randint_like)
+# torch.bernoulli = fix_func(torch.bernoulli)
+# torch.multinomial = fix_func(torch.multinomial)
 
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}")
@@ -586,14 +586,14 @@ if __name__ == "__main__":
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
         # default to ddp
         trainer_config['strategy'] = 'ddp'
-        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            trainer_config['strategy'] = 'dp'
-            trainer_config['accelerator'] = 'mps'
-            trainer_config['devices'] = 1
+        # if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        #     trainer_config['strategy'] = 'dp'
+        #     trainer_config['accelerator'] = 'mps'
+        #     trainer_config['devices'] = 1
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
         if not "devices" in trainer_config:
-            del trainer_config["accelerator"]
+            # del trainer_config["accelerator"]
             cpu = True
         else:
             gpuinfo = trainer_config["devices"]

@@ -10,12 +10,12 @@ from ldm.modules.x_transformer import Encoder, TransformerWrapper  # TODO: can w
 
 
 def get_default_device_type():
-    if torch.cuda.is_available():
-        return "cuda"
-    elif torch.backends.mps.is_available():
-        return "mps"
-    else:
-        return "cpu"
+    # if torch.cuda.is_available():
+    #     return "cuda"
+    # elif torch.backends.mps.is_available():
+    #     return "mps"
+    # else:
+    return "cpu"
 
 def _expand_mask(mask, dtype, tgt_len = None):
     """
