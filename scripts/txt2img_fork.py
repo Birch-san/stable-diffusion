@@ -5,11 +5,13 @@ import torch
 import numpy as np
 from torch import Tensor, FloatTensor
 from omegaconf import OmegaConf
+from collections.abc import MutableMapping
 from PIL import Image
 from PIL.Image import Resampling
 from tqdm import tqdm, trange
 # from imwatermark import WatermarkEncoder
 from itertools import islice, repeat as repeat_, chain, pairwise
+from functools import reduce
 from einops import rearrange, repeat
 from torchvision.utils import make_grid
 import time
@@ -339,6 +341,23 @@ def load_img(path):
     image = torch.from_numpy(image)
     return 2.*image - 1.
 
+# https://stackoverflow.com/a/7205107/5257399
+# by andrew cooke, CC BY-SA 4.0 licensed
+def merge(a, b, path=None):
+    "merges b into a"
+    if path is None: path = []
+    for key in b:
+        if key in a:
+            if (isinstance(a[key], dict) or isinstance(a[key], MutableMapping)) and (isinstance(a[key], dict) or isinstance(a[key], MutableMapping)):
+                merge(a[key], b[key], path + [str(key)])
+            elif a[key] == b[key]:
+                pass # same leaf value
+            else:
+                raise Exception('Conflict at %s' % '.'.join(path + [str(key)]))
+        else:
+            a[key] = b[key]
+    return a
+
 @dataclass
 class WeightedPrompt():
     text: str
@@ -560,6 +579,12 @@ def main():
         help="path to checkpoint of model",
     )
     parser.add_argument(
+        "--clip_version",
+        type=str,
+        default="openai/clip-vit-large-patch14",
+        help="set to 'laion/CLIP-ViT-H-14-laion2B-s32B-b79K' to try LAION's bigger CLIP.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         nargs="?",
@@ -624,6 +649,19 @@ def main():
         opt.outdir = "outputs/txt2img-samples-laion400m"
 
     config = OmegaConf.load(f"{opt.config}")
+    if opt.clip_version:
+        merge(config, {
+            'model': {
+                'params': {
+                    'cond_stage_config': {
+                        'params': {
+                            'version': opt.clip_version
+                        }
+                    }
+                }
+            }
+        })
+        # config['model']['params']['cond_stage_config']['params'] = { 'version': opt.clip_version }
     model: LatentDiffusion = load_model_from_config(config, f"{opt.ckpt}")
 
     device = torch.device(get_device())

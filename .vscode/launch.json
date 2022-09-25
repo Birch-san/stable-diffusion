@@ -62,6 +62,8 @@
       "console": "integratedTerminal",
       "justMyCode": true,
       "args": [
+        "--clip_version",
+        "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
         "--prompt",
         // "Kunkka enjoys a nice coffee with Crystal Maiden. pixiv",
         // "masterpiece character portrait of a blonde girl, full resolution, 4 k, mizuryuu kei, akihiko. yoshida, Pixiv featured, baroque scenic, by artgerm, sylvain sarrailh, rossdraws, wlop, global illumination",

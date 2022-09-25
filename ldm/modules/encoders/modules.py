@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 from functools import partial
-import clip
+# import clip
+import open_clip as clip
 from einops import rearrange, repeat
 from transformers import CLIPTokenizer, CLIPTextModel
 import kornia
@@ -239,5 +240,5 @@ class FrozenClipImageEmbedder(nn.Module):
 
 if __name__ == "__main__":
     from ldm.util import count_params
-    model = FrozenCLIPEmbedder()
+    model = FrozenCLIPEmbedder(version='laion/CLIP-ViT-H-14-laion2B-s32B-b79K')
     count_params(model, verbose=True)
