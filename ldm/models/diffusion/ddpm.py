@@ -335,7 +335,7 @@ class DDPM(pl.LightningModule):
             x = x[..., None]
         x = x.to(self.device)
         x = rearrange(x, 'b h w c -> b c h w')
-        x = x.to(memory_format=torch.contiguous_format).float()
+        x = x.contiguous().float()
         return x
 
     def shared_step(self, batch):
