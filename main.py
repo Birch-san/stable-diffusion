@@ -8,8 +8,12 @@ import pytorch_lightning as pl
 from packaging import version
 from omegaconf import OmegaConf
 from torch.utils.data import random_split, DataLoader, Dataset, Subset
+from torch import FloatTensor, Tensor, nn
 from functools import partial
 from PIL import Image
+from typing import Callable, List, TypeAlias, TypedDict, Optional
+from k_diffusion.sampling import sample_heun, get_sigmas_karras
+from k_diffusion.external import CompVisDenoiser
 
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
@@ -19,6 +23,7 @@ from pytorch_lightning.utilities import rank_zero_info
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
+from ldm.models.diffusion.ddpm import LatentDiffusion, SamplerOutput, SampleCallback, SamplerIntermediates, IntermediateEligible
 
 def get_device():
     if(torch.cuda.is_available()):
@@ -46,6 +51,116 @@ torch.randint_like = fix_func(torch.randint_like)
 torch.bernoulli = fix_func(torch.bernoulli)
 torch.multinomial = fix_func(torch.multinomial)
 
+def repeat_along_dim_0(t: Tensor, factor: int) -> Tensor:
+    """
+    Repeats a tensor's contents along its 0th dim `factor` times.
+
+    repeat_along_dim_0(torch.tensor([[0,1]]), 2)
+    tensor([[0, 1],
+            [0, 1]])
+    # shape changes from (1, 2)
+    #                 to (2, 2)
+    
+    repeat_along_dim_0(torch.tensor([[0,1],[2,3]]), 2)
+    tensor([[0, 1],
+            [2, 3],
+            [0, 1],
+            [2, 3]])
+    # shape changes from (2, 2)
+    #                 to (4, 2)
+    """
+    assert factor >= 1
+    if factor == 1:
+        return t
+    if t.size(dim=0) == 1:
+        # prefer expand() whenever we can, since doesn't copy
+        return t.expand(factor * t.size(dim=0), *(-1,)*(t.ndim-1))
+    return t.repeat((factor, *(1,)*(t.ndim-1)))
+
+class KSamplerCallbackPayload(TypedDict):
+    x: FloatTensor
+    i: int
+    sigma: FloatTensor
+    sigma_hat: FloatTensor
+    denoised: FloatTensor
+
+KSamplerCallback: TypeAlias = Callable[[KSamplerCallbackPayload], None]
+
+class KCFGDenoiser(nn.Module):
+    inner_model: CompVisDenoiser
+    def __init__(self, model: CompVisDenoiser):
+        super().__init__()
+        self.inner_model = model
+
+    def forward(
+        self,
+        x: FloatTensor,
+        sigma: FloatTensor,
+        cond: FloatTensor,
+        unconditional_guidance_scale: float = 1.0,
+        uncond: Optional[FloatTensor] = None,
+    ) -> FloatTensor:
+        if uncond is None or unconditional_guidance_scale == 1.0:
+            return self.inner_model(x, sigma, cond=cond)
+        cond_in = torch.cat([uncond, cond])
+        del uncond, cond
+        x_in = repeat_along_dim_0(x, cond_in.size(dim=0))
+        del x
+        sigma_in = repeat_along_dim_0(sigma, cond_in.size(dim=0))
+        del sigma
+        uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(cond_in.size(dim=0))
+        del x_in, sigma_in, cond_in
+        return uncond + (cond - uncond) * unconditional_guidance_scale
+
+def sample_callback(
+    denoiser: KCFGDenoiser,
+    steps: int,
+    batch_size: int,
+    cond: FloatTensor,
+    channels: int,
+    height: int,
+    width: int,
+    intermediate_eligible: IntermediateEligible,
+    return_intermediates: bool,
+    unconditional_guidance_scale: float,
+    unconditional_conditioning: Optional[FloatTensor] = None,
+    ) -> SamplerOutput:
+    ldm: LatentDiffusion = denoiser.inner_model.inner_model
+    device = ldm.device
+    sigmas: FloatTensor = get_sigmas_karras(
+        n=steps,
+        sigma_min=denoiser.inner_model.sigmas[0].item(),
+        sigma_max=denoiser.inner_model.sigmas[-1].item(),
+        rho=7.,
+        device=device,
+    )
+    extra_args = {
+        'uncond': unconditional_conditioning,
+        'cond': cond,
+        'unconditional_guidance_scale': unconditional_guidance_scale,
+    }
+    shape = (batch_size, channels, height, width)
+    x: FloatTensor = torch.randn(shape, device=device) * sigmas[0]
+
+    intermediates = SamplerIntermediates(x_inter=[x], pred_x0=[x]) if return_intermediates else None
+    def append_intermediate(payload: KSamplerCallbackPayload) -> None:
+        if return_intermediates and intermediate_eligible(step=payload['i']):
+            intermediates['x_inter'].append(payload['x'])
+            intermediates['pred_x0'].append(payload['denoised'])
+    img_callback: KSamplerCallback = append_intermediate
+
+    samples: FloatTensor = sample_heun(
+        model=denoiser,
+        x=x,
+        sigmas=sigmas,
+        extra_args=extra_args,
+        callback=img_callback
+    )
+    return SamplerOutput(samples=samples, intermediates=intermediates)
+
+def make_sample_callback(denoiser: KCFGDenoiser) -> SampleCallback:
+    return partial(sample_callback, denoiser)
+
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}")
     pl_sd = torch.load(ckpt, map_location="cpu")
@@ -60,7 +175,14 @@ def load_model_from_config(config, ckpt, verbose=False):
         print("unexpected keys:")
         print(u)
 
-    return model.to(get_device())
+    model.to(get_device())
+
+    model_k_wrapped = CompVisDenoiser(model, quantize=True)
+    model_k_guidance = KCFGDenoiser(model_k_wrapped)
+    sample_callback_: SampleCallback = make_sample_callback(model_k_guidance)
+    model.register_sample_callback(sample_callback_)
+
+    return model
 
 def get_parser(**parser_kwargs):
     def str2bool(v):

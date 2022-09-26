@@ -6,11 +6,13 @@ https://github.com/CompVis/taming-transformers
 -- merci
 """
 
+from typing_extensions import Self
 import torch
 import torch.nn as nn
 import numpy as np
 import os
 import pytorch_lightning as pl
+from torch import FloatTensor
 from torch.optim.lr_scheduler import LambdaLR
 from einops import rearrange, repeat
 from contextlib import contextmanager
@@ -18,6 +20,7 @@ from functools import partial
 from tqdm import tqdm
 from torchvision.utils import make_grid
 from pytorch_lightning.utilities.distributed import rank_zero_only
+from typing import Optional, Callable, TypeAlias, NamedTuple, List, Protocol, TypedDict
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
@@ -26,6 +29,32 @@ from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, Autoenc
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
 
+class IntermediateEligible(Protocol):
+    @staticmethod
+    def __call__(step: int) -> bool: ...
+
+class SamplerIntermediates(TypedDict):
+    x_inter: List[FloatTensor]
+    pred_x0: List[FloatTensor]
+
+class SamplerOutput(NamedTuple):
+    samples: FloatTensor
+    intermediates: Optional[SamplerIntermediates]
+
+class SampleCallback(Protocol):
+    @staticmethod
+    def __call__(
+        steps: int,
+        batch_size: int,
+        cond: FloatTensor,
+        channels: int,
+        width: int,
+        height: int,
+        intermediate_eligible: IntermediateEligible,
+        return_intermediates: bool,
+        unconditional_guidance_scale: float,
+        unconditional_conditioning: Optional[FloatTensor],
+    ) -> SamplerOutput: ...
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -427,6 +456,7 @@ class DDPM(pl.LightningModule):
 
 class LatentDiffusion(DDPM):
     """main class"""
+    sample_callback: Optional[SampleCallback] = None
     def __init__(self,
                  first_stage_config,
                  cond_stage_config,
@@ -491,6 +521,9 @@ class LatentDiffusion(DDPM):
 
         for param in self.embedding_manager.embedding_parameters():
             param.requires_grad = True
+    
+    def register_sample_callback(self, callback: SampleCallback) -> None:
+        self.sample_callback = callback
 
     def make_cond_schedule(self, ):
         self.cond_ids = torch.full(size=(self.num_timesteps,), fill_value=self.num_timesteps - 1, dtype=torch.long)
@@ -1272,19 +1305,43 @@ class LatentDiffusion(DDPM):
                                   mask=mask, x0=x0)
 
     @torch.no_grad()
-    def sample_log(self,cond,batch_size,ddim, ddim_steps,**kwargs):
-
-        if ddim:
+    def sample_log(
+        self,
+        cond: FloatTensor,
+        batch_size: int,
+        ddim: bool,
+        ddim_steps: int,
+        return_intermediates = True,
+        unconditional_guidance_scale = 1.0,
+        unconditional_conditioning: Optional[FloatTensor] = None,
+        **kwargs
+        ) -> SamplerOutput:
+        if callable(self.sample_callback):
+            intermediate_eligible: IntermediateEligible = lambda step: step % self.log_every_t == 0 or step == ddim_steps - 1
+            samples, intermediates = self.sample_callback(
+                steps=ddim_steps,
+                batch_size=batch_size,
+                cond=cond,
+                unconditional_guidance_scale=unconditional_guidance_scale,
+                unconditional_conditioning=unconditional_conditioning,
+                channels=self.channels,
+                width=self.image_size,
+                height=self.image_size,
+                intermediate_eligible=intermediate_eligible,
+                return_intermediates=return_intermediates
+            )
+        elif ddim:
             ddim_sampler = DDIMSampler(self)
             shape = (self.channels, self.image_size, self.image_size)
             samples, intermediates =ddim_sampler.sample(ddim_steps,batch_size,
-                                                        shape,cond,verbose=False,**kwargs)
+                                                        shape,cond,verbose=False,
+                                                        return_intermediates=return_intermediates,**kwargs)
 
         else:
             samples, intermediates = self.sample(cond=cond, batch_size=batch_size,
-                                                 return_intermediates=True,**kwargs)
+                                                 return_intermediates=return_intermediates,**kwargs)
 
-        return samples, intermediates
+        return SamplerOutput(samples, intermediates)
 
 
     @torch.no_grad()
@@ -1341,7 +1398,7 @@ class LatentDiffusion(DDPM):
             # get denoise row
             with self.ema_scope("Plotting"):
                 samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
-                                                         ddim_steps=ddim_steps,eta=ddim_eta)
+                                                         ddim_steps=ddim_steps,eta=ddim_eta, return_intermediates=plot_denoise_rows)
                 # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True)
             x_samples = self.decode_first_stage(samples)
             log["samples"] = x_samples
@@ -1365,7 +1422,7 @@ class LatentDiffusion(DDPM):
                 with self.ema_scope("Plotting Quantized Denoised"):
                     samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
                                                              ddim_steps=ddim_steps,eta=ddim_eta,
-                                                             quantize_denoised=True)
+                                                             quantize_denoised=True, return_intermediates=True)
                     # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True,
                     #                                      quantize_denoised=True)
                 x_samples = self.decode_first_stage(samples.to(self.device))
@@ -1381,7 +1438,7 @@ class LatentDiffusion(DDPM):
                 with self.ema_scope("Plotting Inpaint"):
 
                     samples, _ = self.sample_log(cond=c,batch_size=N,ddim=use_ddim, eta=ddim_eta,
-                                                ddim_steps=ddim_steps, x0=z[:N], mask=mask)
+                                                ddim_steps=ddim_steps, x0=z[:N], mask=mask, return_intermediates=False)
                 x_samples = self.decode_first_stage(samples.to(self.device))
                 log["samples_inpainting"] = x_samples
                 log["mask"] = mask
@@ -1389,7 +1446,7 @@ class LatentDiffusion(DDPM):
                 # outpaint
                 with self.ema_scope("Plotting Outpaint"):
                     samples, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,eta=ddim_eta,
-                                                ddim_steps=ddim_steps, x0=z[:N], mask=mask)
+                                                ddim_steps=ddim_steps, x0=z[:N], mask=mask, return_intermediates=False)
                 x_samples = self.decode_first_stage(samples.to(self.device))
                 log["samples_outpainting"] = x_samples
 
