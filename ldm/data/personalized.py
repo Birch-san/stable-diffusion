@@ -186,7 +186,7 @@ class PersonalizedBase(Dataset):
         # text = template_fumo.format(placeholder_string)
         match stem:
             case 'nagisa':
-                text = 'Itaru Hinoue nagisa furukawa clannad, clannad jacket cosplay {} plush doll with brown hair, brown eyes, chibi smiling, holding brown briefcase, next to dango'.format(placeholder_string)
+                text = 'photo of Itaru Hinoue nagisa furukawa clannad, clannad jacket cosplay {} plush doll with brown hair, brown eyes, chibi smiling, holding brown briefcase, next to dango'.format(placeholder_string)
             case 'teto':
                 text = 'photo of vocaloid kasane teto {} plush doll with brown hair, brown eyes, chibi smiling'.format(placeholder_string)
             case 'korone':
