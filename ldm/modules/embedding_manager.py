@@ -146,7 +146,7 @@ class EmbeddingManager(nn.Module):
             placeholder_embedding = self.string_to_param_dict[
                 placeholder_string
             ].to(device)
-            placeholder_token = placeholder_token.to(device)
+            placeholder_token = placeholder_token.detach().clone().to(device)
 
             if (
                 self.max_vectors_per_token == 1
