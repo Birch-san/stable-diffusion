@@ -146,12 +146,13 @@ class EmbeddingManager(nn.Module):
             placeholder_embedding = self.string_to_param_dict[
                 placeholder_string
             ].to(device)
+            placeholder_token = placeholder_token.to(device)
 
             if (
                 self.max_vectors_per_token == 1
             ):   # If there's only one vector per token, we can do a simple replacement
                 placeholder_idx = torch.where(
-                    tokenized_text == placeholder_token.to(device)
+                    tokenized_text == placeholder_token
                 )
                 embedded_text[placeholder_idx] = placeholder_embedding
             else:   # otherwise, need to insert and keep track of changing indices
@@ -168,7 +169,7 @@ class EmbeddingManager(nn.Module):
                 )
 
                 placeholder_rows, placeholder_cols = torch.where(
-                    tokenized_text == placeholder_token.to(device)
+                    tokenized_text == placeholder_token
                 )
 
                 if placeholder_rows.nelement() == 0:
@@ -184,21 +185,21 @@ class EmbeddingManager(nn.Module):
                     col = sorted_cols[idx]
 
                     new_token_row = torch.cat(
-                        [
+                        # cat(axis=0) segfaults on MPS if any element has a 0th dim of size 0
+                        [tensor for tensor in (
                             tokenized_text[row][:col],
-                            placeholder_token.repeat(num_vectors_for_token).to(
-                                device
-                            ),
+                            placeholder_token.expand(num_vectors_for_token),
                             tokenized_text[row][col + 1 :],
-                        ],
+                        ) if tensor.size(0) > 0],
                         axis=0,
                     )[:n]
                     new_embed_row = torch.cat(
-                        [
+                        # cat(axis=0) segfaults on MPS if any element has a 0th dim of size 0
+                        [tensor for tensor in (
                             embedded_text[row][:col],
                             placeholder_embedding[:num_vectors_for_token],
                             embedded_text[row][col + 1 :],
-                        ],
+                        ) if tensor.size(0) > 0],
                         axis=0,
                     )[:n]
 
