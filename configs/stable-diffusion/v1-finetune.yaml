@@ -6,6 +6,7 @@ model:
     linear_end: 0.0120
     num_timesteps_cond: 1
     log_every_t: 200
+    # log_every_t: 1
     timesteps: 1000
     first_stage_key: image
     cond_stage_key: caption
@@ -22,9 +23,9 @@ model:
       target: ldm.modules.embedding_manager.EmbeddingManager
       params:
         placeholder_strings: ["*"]
-        initializer_words: ["sculpture"]
+        initializer_words: ["plush", "doll"]
         per_image_tokens: false
-        num_vectors_per_token: 1
+        num_vectors_per_token: 6
         progressive_words: False
 
     unet_config:
@@ -100,12 +101,16 @@ lightning:
       target: main.ImageLogger
       params:
         batch_frequency: 500
-        max_images: 8
+        # batch_frequency: 1
+        # max_images: 8
+        max_images: 3
         increase_log_steps: False
+        log_images_kwargs:
+          ddim_steps: 12
 
   trainer:
-    detect_anomaly: True
-    benchmark: True
+    # detect_anomaly: True
+    benchmark: False
     max_steps: 4000000
 #    max_steps: 4000
     

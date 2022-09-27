@@ -5,6 +5,7 @@ from PIL import Image
 from PIL.Image import Resampling
 from torch.utils.data import Dataset
 from torchvision import transforms
+from pathlib import Path
 
 # import random
 
@@ -106,7 +107,8 @@ class PersonalizedBase(Dataset):
         data_root,
         size=None,
         repeats=100,
-        interpolation='bicubic',
+        # interpolation='bicubic',
+        interpolation='lanczos',
         flip_p=0.5,
         set='train',
         placeholder_token='*',
@@ -159,7 +161,9 @@ class PersonalizedBase(Dataset):
 
     def __getitem__(self, i):
         example = {}
-        image = Image.open(self.image_paths[i % self.num_images])
+        image_path: str = self.image_paths[i % self.num_images]
+        stem: str = Path(image_path).stem
+        image = Image.open(image_path)
 
         if not image.mode == 'RGB':
             image = image.convert('RGB')
@@ -178,7 +182,21 @@ class PersonalizedBase(Dataset):
         #     text = random.choice(imagenet_templates_small).format(
         #         placeholder_string
         #     )
-        text = template_fumo.format(placeholder_string)
+
+        # text = template_fumo.format(placeholder_string)
+        match stem:
+            case 'nagisa':
+                text = 'Itaru Hinoue nagisa furukawa clannad, clannad jacket cosplay {} plush doll with brown hair, brown eyes, chibi smiling, holding brown briefcase, next to dango'.format(placeholder_string)
+            case 'teto':
+                text = 'photo of vocaloid kasane teto {} plush doll with brown hair, brown eyes, chibi smiling'.format(placeholder_string)
+            case 'korone':
+                text = 'photo of anime girl {} plush doll with yellow jacket, white dress, brown hair, brown eyes, hairclip, uwu face'.format(placeholder_string)
+            case 'kudo1':
+                text = 'photo of kud wafter noumi little busters na-ga {} plush doll with yellow jacket, white dress, brown hair, brown eyes, chibi smiling'.format(placeholder_string)
+            case 'patchouli':
+                text = 'photo of patchouli touhou {} plush doll chibi unhappy'.format(placeholder_string)
+            case _:
+                assert False
 
         example['caption'] = text
 
