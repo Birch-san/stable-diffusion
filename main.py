@@ -8,8 +8,12 @@ import pytorch_lightning as pl
 from packaging import version
 from omegaconf import OmegaConf
 from torch.utils.data import random_split, DataLoader, Dataset, Subset
+from torch import FloatTensor, Tensor, nn
 from functools import partial
 from PIL import Image
+from typing import Callable, List, TypeAlias, TypedDict, Optional
+from k_diffusion.sampling import sample_heun, get_sigmas_karras
+from k_diffusion.external import CompVisDenoiser
 
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
@@ -19,7 +23,166 @@ from pytorch_lightning.utilities import rank_zero_info
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
+from ldm.models.diffusion.ddpm import LatentDiffusion, SamplerOutput, SampleCallback, SamplerIntermediates, IntermediateEligible
 
+def get_device():
+    if(torch.cuda.is_available()):
+        return 'cuda'
+    elif(torch.backends.mps.is_available()):
+        return 'mps'
+    else:
+        return 'cpu'
+
+def fix_func(orig):
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        def new_func(*args, **kw):
+            device = kw.get("device", "mps")
+            kw["device"]="cpu"
+            return orig(*args, **kw).to(device)
+        return new_func
+    return orig
+
+torch.rand = fix_func(torch.rand)
+torch.rand_like = fix_func(torch.rand_like)
+torch.randn = fix_func(torch.randn)
+torch.randn_like = fix_func(torch.randn_like)
+torch.randint = fix_func(torch.randint)
+torch.randint_like = fix_func(torch.randint_like)
+torch.bernoulli = fix_func(torch.bernoulli)
+torch.multinomial = fix_func(torch.multinomial)
+
+def repeat_along_dim_0(t: Tensor, factor: int) -> Tensor:
+    """
+    Repeats a tensor's contents along its 0th dim `factor` times.
+
+    repeat_along_dim_0(torch.tensor([[0,1]]), 2)
+    tensor([[0, 1],
+            [0, 1]])
+    # shape changes from (1, 2)
+    #                 to (2, 2)
+    
+    repeat_along_dim_0(torch.tensor([[0,1],[2,3]]), 2)
+    tensor([[0, 1],
+            [2, 3],
+            [0, 1],
+            [2, 3]])
+    # shape changes from (2, 2)
+    #                 to (4, 2)
+    """
+    assert factor >= 1
+    if factor == 1:
+        return t
+    if t.size(dim=0) == 1:
+        # prefer expand() whenever we can, since doesn't copy
+        return t.expand(factor * t.size(dim=0), *(-1,)*(t.ndim-1))
+    return t.repeat((factor, *(1,)*(t.ndim-1)))
+
+class KSamplerCallbackPayload(TypedDict):
+    x: FloatTensor
+    i: int
+    sigma: FloatTensor
+    sigma_hat: FloatTensor
+    denoised: FloatTensor
+
+KSamplerCallback: TypeAlias = Callable[[KSamplerCallbackPayload], None]
+
+class KCFGDenoiser(nn.Module):
+    inner_model: CompVisDenoiser
+    def __init__(self, model: CompVisDenoiser):
+        super().__init__()
+        self.inner_model = model
+
+    def forward(
+        self,
+        x: FloatTensor,
+        sigma: FloatTensor,
+        cond: FloatTensor,
+        unconditional_guidance_scale: float = 1.0,
+        uncond: Optional[FloatTensor] = None,
+    ) -> FloatTensor:
+        if uncond is None or unconditional_guidance_scale == 1.0:
+            return self.inner_model(x, sigma, cond=cond)
+        cond_in = torch.cat([uncond, cond])
+        del uncond, cond
+        x_in = repeat_along_dim_0(x, cond_in.size(dim=0))
+        del x
+        sigma_in = repeat_along_dim_0(sigma, cond_in.size(dim=0))
+        del sigma
+        uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(cond_in.size(dim=0))
+        del x_in, sigma_in, cond_in
+        return uncond + (cond - uncond) * unconditional_guidance_scale
+
+def sample_callback(
+    denoiser: KCFGDenoiser,
+    steps: int,
+    batch_size: int,
+    cond: FloatTensor,
+    channels: int,
+    height: int,
+    width: int,
+    intermediate_eligible: IntermediateEligible,
+    return_intermediates: bool,
+    unconditional_guidance_scale: float,
+    unconditional_conditioning: Optional[FloatTensor] = None,
+    ) -> SamplerOutput:
+    ldm: LatentDiffusion = denoiser.inner_model.inner_model
+    device = ldm.device
+    sigmas: FloatTensor = get_sigmas_karras(
+        n=steps,
+        sigma_min=denoiser.inner_model.sigmas[0].item(),
+        sigma_max=denoiser.inner_model.sigmas[-1].item(),
+        rho=7.,
+        device=device,
+    )
+    extra_args = {
+        'uncond': unconditional_conditioning,
+        'cond': cond,
+        'unconditional_guidance_scale': unconditional_guidance_scale,
+    }
+    shape = (batch_size, channels, height, width)
+    x: FloatTensor = torch.randn(shape, device=device) * sigmas[0]
+
+    intermediates = SamplerIntermediates(x_inter=[x], pred_x0=[x]) if return_intermediates else None
+    def append_intermediate(payload: KSamplerCallbackPayload) -> None:
+        if return_intermediates and intermediate_eligible(step=payload['i']):
+            intermediates['x_inter'].append(payload['x'])
+            intermediates['pred_x0'].append(payload['denoised'])
+    img_callback: KSamplerCallback = append_intermediate
+
+    samples: FloatTensor = sample_heun(
+        model=denoiser,
+        x=x,
+        sigmas=sigmas,
+        extra_args=extra_args,
+        callback=img_callback
+    )
+    return SamplerOutput(samples=samples, intermediates=intermediates)
+
+def make_sample_callback(denoiser: KCFGDenoiser) -> SampleCallback:
+    return partial(sample_callback, denoiser)
+
+def load_model_from_config(config, ckpt, verbose=False):
+    print(f"Loading model from {ckpt}")
+    pl_sd = torch.load(ckpt, map_location="cpu")
+    sd = pl_sd["state_dict"]
+    config.model.params.ckpt_path = ckpt
+    model = instantiate_from_config(config.model)
+    m, u = model.load_state_dict(sd, strict=False)
+    if len(m) > 0 and verbose:
+        print("missing keys:")
+        print(m)
+    if len(u) > 0 and verbose:
+        print("unexpected keys:")
+        print(u)
+
+    model.to(get_device())
+
+    model_k_wrapped = CompVisDenoiser(model, quantize=True)
+    model_k_guidance = KCFGDenoiser(model_k_wrapped)
+    sample_callback_: SampleCallback = make_sample_callback(model_k_guidance)
+    model.register_sample_callback(sample_callback_)
+
+    return model
 
 def get_parser(**parser_kwargs):
     def str2bool(v):
@@ -120,6 +283,23 @@ def get_parser(**parser_kwargs):
         default=True,
         help="scale base-lr by ngpu * batch_size * n_accumulate",
     )
+
+    parser.add_argument(
+        "--datadir_in_name", 
+        type=str2bool, 
+        nargs="?", 
+        const=True, 
+        default=True, 
+        help="Prepend the final directory in the data_root to the output directory name")
+
+    parser.add_argument("--actual_resume", type=str, default="", help="Path to model to actually resume from")
+    parser.add_argument("--data_root", type=str, required=True, help="Path to directory with training images")
+
+    parser.add_argument("--embedding_manager_ckpt", type=str, default="", help="Initialize embedding manager from a checkpoint")
+    parser.add_argument("--placeholder_tokens", type=str, nargs="+", default=["*"])
+
+    parser.add_argument("--init_word", type=str, help="Word to use as source for initial token embedding.")
+
     return parser
 
 
@@ -295,7 +475,8 @@ class ImageLogger(Callback):
         self.batch_freq = batch_frequency
         self.max_images = max_images
         self.logger_log_images = {
-            pl.loggers.TestTubeLogger: self._testtube,
+            # pl.loggers.TestTubeLogger: self._testtube,
+            # pl.loggers.CSVLogger: self._testtube,
         }
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
@@ -380,11 +561,11 @@ class ImageLogger(Callback):
             return True
         return False
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=None):
         if not self.disabled and (pl_module.global_step > 0 or self.log_first_step):
             self.log_img(pl_module, batch, batch_idx, split="train")
 
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=None):
         if not self.disabled and pl_module.global_step > 0:
             self.log_img(pl_module, batch, batch_idx, split="val")
         if hasattr(pl_module, 'calibrate_grad_norm'):
@@ -396,21 +577,25 @@ class CUDACallback(Callback):
     # see https://github.com/SeanNaren/minGPT/blob/master/mingpt/callback.py
     def on_train_epoch_start(self, trainer, pl_module):
         # Reset the memory use counter
-        torch.cuda.reset_peak_memory_stats(trainer.root_gpu)
-        torch.cuda.synchronize(trainer.root_gpu)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(trainer.root_gpu)
+            torch.cuda.synchronize(trainer.root_gpu)
         self.start_time = time.time()
 
-    def on_train_epoch_end(self, trainer, pl_module, outputs):
-        torch.cuda.synchronize(trainer.root_gpu)
-        max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
+    def on_train_epoch_end(self, trainer, pl_module, outputs=None):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(trainer.root_gpu)
+            max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
         epoch_time = time.time() - self.start_time
 
         try:
-            max_memory = trainer.training_type_plugin.reduce(max_memory)
+            if torch.cuda.is_available():
+                max_memory = trainer.training_type_plugin.reduce(max_memory)
             epoch_time = trainer.training_type_plugin.reduce(epoch_time)
 
             rank_zero_info(f"Average Epoch time: {epoch_time:.2f} seconds")
-            rank_zero_info(f"Average Peak memory {max_memory:.2f}MiB")
+            if torch.cuda.is_available():
+                rank_zero_info(f"Average Peak memory {max_memory:.2f}MiB")
         except AttributeError:
             pass
 
@@ -503,6 +688,10 @@ if __name__ == "__main__":
         else:
             name = ""
         nowname = now + name + opt.postfix
+
+        if opt.datadir_in_name:
+            now = os.path.basename(os.path.normpath(opt.data_root)) + now
+        
         logdir = os.path.join(opt.logdir, nowname)
 
     ckptdir = os.path.join(logdir, "checkpoints")
@@ -518,21 +707,35 @@ if __name__ == "__main__":
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
         # default to ddp
-        trainer_config["accelerator"] = "ddp"
+        trainer_config['strategy'] = 'ddp'
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            trainer_config['strategy'] = 'dp'
+            trainer_config['accelerator'] = 'mps'
+            trainer_config['devices'] = 1
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
-        if not "gpus" in trainer_config:
+        if not "devices" in trainer_config:
             del trainer_config["accelerator"]
             cpu = True
         else:
-            gpuinfo = trainer_config["gpus"]
+            gpuinfo = trainer_config["devices"]
             print(f"Running on GPUs {gpuinfo}")
             cpu = False
         trainer_opt = argparse.Namespace(**trainer_config)
         lightning_config.trainer = trainer_config
 
         # model
-        model = instantiate_from_config(config.model)
+        # config.model.params.personalization_config.params.init_word = opt.init_word
+        config.model.params.personalization_config.params.embedding_manager_ckpt = opt.embedding_manager_ckpt
+        config.model.params.personalization_config.params.placeholder_tokens = opt.placeholder_tokens
+
+        if opt.init_word:
+            config.model.params.personalization_config.params.initializer_words[0] = opt.init_word
+
+        if opt.actual_resume:
+            model = load_model_from_config(config, opt.actual_resume)
+        else:
+            model = instantiate_from_config(config.model)
 
         # trainer and callbacks
         trainer_kwargs = dict()
@@ -543,6 +746,7 @@ if __name__ == "__main__":
                 "target": "pytorch_lightning.loggers.WandbLogger",
                 "params": {
                     "name": nowname,
+                    "project": 'stable-diffusion-fumo-inversion',
                     "save_dir": logdir,
                     "offline": opt.debug,
                     "id": nowname,
@@ -555,8 +759,15 @@ if __name__ == "__main__":
                     "save_dir": logdir,
                 }
             },
+            'csv': {
+                'target': 'pytorch_lightning.loggers.CSVLogger',
+                'params': {
+                    'name': 'csv',
+                    'save_dir': logdir,
+                },
+            }
         }
-        default_logger_cfg = default_logger_cfgs["testtube"]
+        default_logger_cfg = default_logger_cfgs["wandb"]
         if "logger" in lightning_config:
             logger_cfg = lightning_config.logger
         else:
@@ -578,7 +789,7 @@ if __name__ == "__main__":
         if hasattr(model, "monitor"):
             print(f"Monitoring {model.monitor} as checkpoint metric.")
             default_modelckpt_cfg["params"]["monitor"] = model.monitor
-            default_modelckpt_cfg["params"]["save_top_k"] = 3
+            default_modelckpt_cfg["params"]["save_top_k"] = 1
 
         if "modelcheckpoint" in lightning_config:
             modelckpt_cfg = lightning_config.modelcheckpoint
@@ -655,11 +866,14 @@ if __name__ == "__main__":
             del callbacks_cfg['ignore_keys_callback']
 
         trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
+        trainer_kwargs["max_steps"] = opt.max_steps
 
         trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
         trainer.logdir = logdir  ###
 
         # data
+        config.data.params.train.params.data_root = opt.data_root
+        config.data.params.validation.params.data_root = opt.data_root
         data = instantiate_from_config(config.data)
         # NOTE according to https://pytorch-lightning.readthedocs.io/en/latest/datamodules.html
         # calling these ourselves should not be necessary but it is.
@@ -673,7 +887,10 @@ if __name__ == "__main__":
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
         if not cpu:
-            ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+            if isinstance(lightning_config.trainer.devices, int):
+                ngpu = lightning_config.trainer.devices
+            else:
+                ngpu = len(lightning_config.trainer.devices.strip(",").split(','))
         else:
             ngpu = 1
         if 'accumulate_grad_batches' in lightning_config.trainer:
@@ -710,8 +927,8 @@ if __name__ == "__main__":
 
         import signal
 
-        signal.signal(signal.SIGUSR1, melk)
-        signal.signal(signal.SIGUSR2, divein)
+        signal.signal(signal.SIGTERM, melk)
+        signal.signal(signal.SIGTERM, divein)
 
         # run
         if opt.train:
@@ -737,5 +954,5 @@ if __name__ == "__main__":
             dst = os.path.join(dst, "debug_runs", name)
             os.makedirs(os.path.split(dst)[0], exist_ok=True)
             os.rename(logdir, dst)
-        if trainer.global_rank == 0:
-            print(trainer.profiler.summary())
+        # if trainer.global_rank == 0:
+        #     print(trainer.profiler.summary())

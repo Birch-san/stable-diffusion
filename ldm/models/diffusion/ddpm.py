@@ -6,10 +6,13 @@ https://github.com/CompVis/taming-transformers
 -- merci
 """
 
+from typing_extensions import Self
 import torch
 import torch.nn as nn
 import numpy as np
+import os
 import pytorch_lightning as pl
+from torch import FloatTensor
 from torch.optim.lr_scheduler import LambdaLR
 from einops import rearrange, repeat
 from contextlib import contextmanager
@@ -17,6 +20,7 @@ from functools import partial
 from tqdm import tqdm
 from torchvision.utils import make_grid
 from pytorch_lightning.utilities.distributed import rank_zero_only
+from typing import Optional, Callable, TypeAlias, NamedTuple, List, Protocol, TypedDict
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
@@ -25,6 +29,32 @@ from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, Autoenc
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
 
+class IntermediateEligible(Protocol):
+    @staticmethod
+    def __call__(step: int) -> bool: ...
+
+class SamplerIntermediates(TypedDict):
+    x_inter: List[FloatTensor]
+    pred_x0: List[FloatTensor]
+
+class SamplerOutput(NamedTuple):
+    samples: FloatTensor
+    intermediates: Optional[SamplerIntermediates]
+
+class SampleCallback(Protocol):
+    @staticmethod
+    def __call__(
+        steps: int,
+        batch_size: int,
+        cond: FloatTensor,
+        channels: int,
+        width: int,
+        height: int,
+        intermediate_eligible: IntermediateEligible,
+        return_intermediates: bool,
+        unconditional_guidance_scale: float,
+        unconditional_conditioning: Optional[FloatTensor],
+    ) -> SamplerOutput: ...
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -63,6 +93,7 @@ class DDPM(pl.LightningModule):
                  cosine_s=8e-3,
                  given_betas=None,
                  original_elbo_weight=0.,
+                 embedding_reg_weight=0.,
                  v_posterior=0.,  # weight for choosing posterior variance as sigma = (1-v) * beta_tilde + v * beta
                  l_simple_weight=1.,
                  conditioning_key=None,
@@ -97,6 +128,7 @@ class DDPM(pl.LightningModule):
         self.v_posterior = v_posterior
         self.original_elbo_weight = original_elbo_weight
         self.l_simple_weight = l_simple_weight
+        self.embedding_reg_weight = embedding_reg_weight
 
         if monitor is not None:
             self.monitor = monitor
@@ -330,8 +362,9 @@ class DDPM(pl.LightningModule):
         x = batch[k]
         if len(x.shape) == 3:
             x = x[..., None]
+        x = x.to(self.device)
         x = rearrange(x, 'b h w c -> b c h w')
-        x = x.to(memory_format=torch.contiguous_format).float()
+        x = x.contiguous().float()
         return x
 
     def shared_step(self, batch):
@@ -423,9 +456,11 @@ class DDPM(pl.LightningModule):
 
 class LatentDiffusion(DDPM):
     """main class"""
+    sample_callback: Optional[SampleCallback] = None
     def __init__(self,
                  first_stage_config,
                  cond_stage_config,
+                 personalization_config,
                  num_timesteps_cond=None,
                  cond_stage_key="image",
                  cond_stage_trainable=False,
@@ -467,6 +502,28 @@ class LatentDiffusion(DDPM):
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys)
             self.restarted_from_ckpt = True
+        
+        self.cond_stage_model.train = disabled_train
+        for param in self.cond_stage_model.parameters():
+            param.requires_grad = False
+
+        self.model.eval()
+        self.model.train = disabled_train
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        self.embedding_manager = self.instantiate_embedding_manager(personalization_config, self.cond_stage_model)
+
+        self.emb_ckpt_counter = 0
+
+        # if self.embedding_manager.is_clip:
+        #     self.cond_stage_model.update_embedding_func(self.embedding_manager)
+
+        for param in self.embedding_manager.embedding_parameters():
+            param.requires_grad = True
+    
+    def register_sample_callback(self, callback: SampleCallback) -> None:
+        self.sample_callback = callback
 
     def make_cond_schedule(self, ):
         self.cond_ids = torch.full(size=(self.num_timesteps,), fill_value=self.num_timesteps - 1, dtype=torch.long)
@@ -475,7 +532,7 @@ class LatentDiffusion(DDPM):
 
     @rank_zero_only
     @torch.no_grad()
-    def on_train_batch_start(self, batch, batch_idx, dataloader_idx):
+    def on_train_batch_start(self, batch, batch_idx, dataloader_idx=None):
         # only for very first batch
         if self.scale_by_std and self.current_epoch == 0 and self.global_step == 0 and batch_idx == 0 and not self.restarted_from_ckpt:
             assert self.scale_factor == 1., 'rather not use custom rescaling and std-rescaling simultaneously'
@@ -526,6 +583,14 @@ class LatentDiffusion(DDPM):
             assert config != '__is_unconditional__'
             model = instantiate_from_config(config)
             self.cond_stage_model = model
+    
+    def instantiate_embedding_manager(self, config, embedder):
+        model = instantiate_from_config(config, embedder=embedder)
+
+        if config.params.get("embedding_manager_ckpt", None): # do not load if missing OR empty string
+            model.load(config.params.embedding_manager_ckpt)
+
+        return model
 
     def _get_denoise_row_from_list(self, samples, desc='', force_no_decoder_quantization=False):
         denoise_row = []
@@ -551,7 +616,7 @@ class LatentDiffusion(DDPM):
     def get_learned_conditioning(self, c):
         if self.cond_stage_forward is None:
             if hasattr(self.cond_stage_model, 'encode') and callable(self.cond_stage_model.encode):
-                c = self.cond_stage_model.encode(c)
+                c = self.cond_stage_model.encode(c, embedding_manager=self.embedding_manager)
                 if isinstance(c, DiagonalGaussianDistribution):
                     c = c.mode()
             else:
@@ -1027,7 +1092,7 @@ class LatentDiffusion(DDPM):
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
-        logvar_t = self.logvar[t].to(self.device)
+        logvar_t = self.logvar[t.item()].to(self.device)
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
         # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
@@ -1041,6 +1106,14 @@ class LatentDiffusion(DDPM):
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})
+
+        if self.embedding_reg_weight > 0:
+            loss_embedding_reg = self.embedding_manager.embedding_to_coarse_loss().mean()
+
+            loss_dict.update({f'{prefix}/loss_emb_reg': loss_embedding_reg})
+
+            loss += (self.embedding_reg_weight * loss_embedding_reg)
+            loss_dict.update({f'{prefix}/loss': loss})
 
         return loss, loss_dict
 
@@ -1232,25 +1305,49 @@ class LatentDiffusion(DDPM):
                                   mask=mask, x0=x0)
 
     @torch.no_grad()
-    def sample_log(self,cond,batch_size,ddim, ddim_steps,**kwargs):
-
-        if ddim:
+    def sample_log(
+        self,
+        cond: FloatTensor,
+        batch_size: int,
+        ddim: bool,
+        ddim_steps: int,
+        return_intermediates = True,
+        unconditional_guidance_scale = 1.0,
+        unconditional_conditioning: Optional[FloatTensor] = None,
+        **kwargs
+        ) -> SamplerOutput:
+        if callable(self.sample_callback):
+            intermediate_eligible: IntermediateEligible = lambda step: step % self.log_every_t == 0 or step == ddim_steps - 1
+            samples, intermediates = self.sample_callback(
+                steps=ddim_steps,
+                batch_size=batch_size,
+                cond=cond,
+                unconditional_guidance_scale=unconditional_guidance_scale,
+                unconditional_conditioning=unconditional_conditioning,
+                channels=self.channels,
+                width=self.image_size,
+                height=self.image_size,
+                intermediate_eligible=intermediate_eligible,
+                return_intermediates=return_intermediates
+            )
+        elif ddim:
             ddim_sampler = DDIMSampler(self)
             shape = (self.channels, self.image_size, self.image_size)
             samples, intermediates =ddim_sampler.sample(ddim_steps,batch_size,
-                                                        shape,cond,verbose=False,**kwargs)
+                                                        shape,cond,verbose=False,
+                                                        return_intermediates=return_intermediates,**kwargs)
 
         else:
             samples, intermediates = self.sample(cond=cond, batch_size=batch_size,
-                                                 return_intermediates=True,**kwargs)
+                                                 return_intermediates=return_intermediates,**kwargs)
 
-        return samples, intermediates
+        return SamplerOutput(samples, intermediates)
 
 
     @torch.no_grad()
     def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
-                   quantize_denoised=True, inpaint=True, plot_denoise_rows=False, plot_progressive_rows=True,
-                   plot_diffusion_rows=True, **kwargs):
+                   quantize_denoised=True, inpaint=False, plot_denoise_rows=False, plot_progressive_rows=False,
+                   plot_diffusion_rows=False, **kwargs):
 
         use_ddim = ddim_steps is not None
 
@@ -1301,13 +1398,23 @@ class LatentDiffusion(DDPM):
             # get denoise row
             with self.ema_scope("Plotting"):
                 samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
-                                                         ddim_steps=ddim_steps,eta=ddim_eta)
+                                                         ddim_steps=ddim_steps,eta=ddim_eta, return_intermediates=plot_denoise_rows)
                 # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True)
             x_samples = self.decode_first_stage(samples)
             log["samples"] = x_samples
             if plot_denoise_rows:
                 denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
                 log["denoise_row"] = denoise_grid
+            
+            uc = self.get_learned_conditioning(len(c) * [""])
+            sample_scaled, _ = self.sample_log(cond=c, 
+                                               batch_size=N, 
+                                               ddim=use_ddim, 
+                                               ddim_steps=ddim_steps,
+                                               eta=ddim_eta,                                                 
+                                               unconditional_guidance_scale=5.0,
+                                               unconditional_conditioning=uc)
+            log["samples_scaled"] = self.decode_first_stage(sample_scaled)
 
             if quantize_denoised and not isinstance(self.first_stage_model, AutoencoderKL) and not isinstance(
                     self.first_stage_model, IdentityFirstStage):
@@ -1315,7 +1422,7 @@ class LatentDiffusion(DDPM):
                 with self.ema_scope("Plotting Quantized Denoised"):
                     samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
                                                              ddim_steps=ddim_steps,eta=ddim_eta,
-                                                             quantize_denoised=True)
+                                                             quantize_denoised=True, return_intermediates=True)
                     # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True,
                     #                                      quantize_denoised=True)
                 x_samples = self.decode_first_stage(samples.to(self.device))
@@ -1331,7 +1438,7 @@ class LatentDiffusion(DDPM):
                 with self.ema_scope("Plotting Inpaint"):
 
                     samples, _ = self.sample_log(cond=c,batch_size=N,ddim=use_ddim, eta=ddim_eta,
-                                                ddim_steps=ddim_steps, x0=z[:N], mask=mask)
+                                                ddim_steps=ddim_steps, x0=z[:N], mask=mask, return_intermediates=False)
                 x_samples = self.decode_first_stage(samples.to(self.device))
                 log["samples_inpainting"] = x_samples
                 log["mask"] = mask
@@ -1339,7 +1446,7 @@ class LatentDiffusion(DDPM):
                 # outpaint
                 with self.ema_scope("Plotting Outpaint"):
                     samples, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,eta=ddim_eta,
-                                                ddim_steps=ddim_steps, x0=z[:N], mask=mask)
+                                                ddim_steps=ddim_steps, x0=z[:N], mask=mask, return_intermediates=False)
                 x_samples = self.decode_first_stage(samples.to(self.device))
                 log["samples_outpainting"] = x_samples
 
@@ -1360,13 +1467,18 @@ class LatentDiffusion(DDPM):
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        params = list(self.model.parameters())
-        if self.cond_stage_trainable:
-            print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
-            params = params + list(self.cond_stage_model.parameters())
-        if self.learn_logvar:
-            print('Diffusion model optimizing logvar')
-            params.append(self.logvar)
+        if self.embedding_manager is None:
+            params = list(self.model.parameters())
+            if self.cond_stage_trainable:
+                print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
+                params = params + list(self.cond_stage_model.parameters())
+            if self.learn_logvar:
+                print('Diffusion model optimizing logvar')
+                params.append(self.logvar)
+        else:
+            params = list(self.embedding_manager.embedding_parameters())
+            # params = list(self.cond_stage_model.transformer.text_model.embeddings.embedding_manager.embedding_parameters())
+        
         opt = torch.optim.AdamW(params, lr=lr)
         if self.use_scheduler:
             assert 'target' in self.scheduler_config
@@ -1390,6 +1502,20 @@ class LatentDiffusion(DDPM):
         x = nn.functional.conv2d(x, weight=self.colorize)
         x = 2. * (x - x.min()) / (x.max() - x.min()) - 1.
         return x
+    
+    @rank_zero_only
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint.clear()
+
+        if os.path.isdir(self.trainer.checkpoint_callback.dirpath):
+            self.embedding_manager.save(os.path.join(self.trainer.checkpoint_callback.dirpath, "embeddings.pt"))
+
+            if (self.global_step - self.emb_ckpt_counter) > 500:
+                self.embedding_manager.save(os.path.join(self.trainer.checkpoint_callback.dirpath, f"embeddings_gs-{self.global_step}.pt"))
+
+                self.emb_ckpt_counter += 500
+
+
 
 
 class DiffusionWrapper(pl.LightningModule):

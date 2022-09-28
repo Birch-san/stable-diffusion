@@ -615,6 +615,13 @@ def main():
         default=0.75,
         help="strength for noising/unnoising. 1.0 corresponds to full destruction of information in init image",
     )
+    parser.add_argument(
+        '--embedding_path',
+        type=str,
+        nargs="?",
+        default=None,
+        help="Path to a pre-trained embedding manager checkpoint"
+    )
     opt = parser.parse_args()
 
     if opt.laion400m:
@@ -625,6 +632,8 @@ def main():
 
     config = OmegaConf.load(f"{opt.config}")
     model: LatentDiffusion = load_model_from_config(config, f"{opt.ckpt}")
+    if opt.embedding_path is not None:
+        model.embedding_manager.load(opt.embedding_path)
 
     device = torch.device(get_device())
     model = model.to(device)
