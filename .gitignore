@@ -7,6 +7,8 @@ __pycache__/
 /src/taming-transformers/
 /src/gfpgan/
 /src/k-diffusion/
+/src/open-clip-torch/
+/src/transformers/
 /*.png
 /*.pt
 /logs/
