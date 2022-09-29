@@ -71,25 +71,13 @@ class EmbeddingManager(nn.Module):
 
         self.max_vectors_per_token = num_vectors_per_token
 
-        if hasattr(
-            embedder, 'tokenizer'
-        ):   # using Stable Diffusion's CLIP encoder
-            self.is_clip = True
-            get_token_for_string = partial(
-                get_clip_token_for_string, embedder.tokenizer
-            )
-            get_embedding_for_tkn = partial(
-                get_embedding_for_clip_token,
-                embedder.transformer.text_model.embeddings,
-            )
-            token_dim = 1280
-        else:   # using LDM's BERT encoder
-            self.is_clip = False
-            get_token_for_string = partial(
-                get_bert_token_for_string, embedder.tknz_fn
-            )
-            get_embedding_for_tkn = embedder.transformer.token_emb
-            token_dim = 1280
+        self.is_clip = True
+        get_token_for_string = lambda _: torch.tensor(265, device=embedder.device)
+        get_embedding_for_tkn = partial(
+            get_embedding_for_clip_token,
+            embedder.transformer.text_model.embeddings,
+        )
+        token_dim = 1280
 
         if per_image_tokens:
             placeholder_strings.extend(per_img_token_list)
