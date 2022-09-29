@@ -136,77 +136,16 @@ class EmbeddingManager(nn.Module):
         tokenized_text,
         embedded_text,
     ):
-        b, n, device = *tokenized_text.shape, tokenized_text.device
+        placeholder_token = self.string_to_token_dict['*']
 
-        for (
-            placeholder_string,
-            placeholder_token,
-        ) in self.string_to_token_dict.items():
+        cpu_item = placeholder_token.item()
+        assert cpu_item == 265
+        # placeholder_token = placeholder_token.detach().clone().to(tokenized_text.device)
+        placeholder_token = placeholder_token.to(tokenized_text.device)
+        gpu_item = placeholder_token.item()
+        assert gpu_item == cpu_item, f"GPU item was: {gpu_item}, expected {cpu_item}. This indicates failure to transfer tensor from CPU to GPU"
 
-            placeholder_embedding = self.string_to_param_dict[
-                placeholder_string
-            ].to(device)
-            placeholder_token = placeholder_token.detach().clone().to(device)
-
-            if (
-                self.max_vectors_per_token == 1
-            ):   # If there's only one vector per token, we can do a simple replacement
-                placeholder_idx = torch.where(
-                    tokenized_text == placeholder_token
-                )
-                embedded_text[placeholder_idx] = placeholder_embedding
-            else:   # otherwise, need to insert and keep track of changing indices
-                if self.progressive_words:
-                    self.progressive_counter += 1
-                    max_step_tokens = (
-                        1 + self.progressive_counter // PROGRESSIVE_SCALE
-                    )
-                else:
-                    max_step_tokens = self.max_vectors_per_token
-
-                num_vectors_for_token = min(
-                    placeholder_embedding.shape[0], max_step_tokens
-                )
-
-                placeholder_rows, placeholder_cols = torch.where(
-                    tokenized_text == placeholder_token
-                )
-
-                if placeholder_rows.nelement() == 0:
-                    continue
-
-                sorted_cols, sort_idx = torch.sort(
-                    placeholder_cols, descending=True
-                )
-                sorted_rows = placeholder_rows[sort_idx]
-
-                for idx in range(len(sorted_rows)):
-                    row = sorted_rows[idx]
-                    col = sorted_cols[idx]
-
-                    new_token_row = torch.cat(
-                        # cat(axis=0) segfaults on MPS if any element has a 0th dim of size 0
-                        [tensor for tensor in (
-                            tokenized_text[row][:col],
-                            placeholder_token.expand(num_vectors_for_token),
-                            tokenized_text[row][col + 1 :],
-                        ) if tensor.size(0) > 0],
-                        axis=0,
-                    )[:n]
-                    new_embed_row = torch.cat(
-                        # cat(axis=0) segfaults on MPS if any element has a 0th dim of size 0
-                        [tensor for tensor in (
-                            embedded_text[row][:col],
-                            placeholder_embedding[:num_vectors_for_token],
-                            embedded_text[row][col + 1 :],
-                        ) if tensor.size(0) > 0],
-                        axis=0,
-                    )[:n]
-
-                    embedded_text[row] = new_embed_row
-                    tokenized_text[row] = new_token_row
-
-        return embedded_text
+        assert False, "Okay, if you got this far then there's no problem. I simplified this function too much to return the right thing though, so let's abort."
 
     def save(self, ckpt_path):
         torch.save(
