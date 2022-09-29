@@ -1,18 +1,21 @@
-from omegaconf import OmegaConf
-from ldm.models.diffusion.ddpm import CondStage
-
-from ldm.util import instantiate_from_config
+from ldm.modules.encoders.modules import FrozenCLIPEmbedder
+from ldm.modules.embedding_manager import EmbeddingManager
 
 def main():
-    config = OmegaConf.load("configs/stable-diffusion/v1-inference.yaml")
-    modelCS: CondStage = instantiate_from_config(config.modelCondStage)
-    modelCS.to('mps')
-    modelCS.eval()
+    clip = FrozenCLIPEmbedder()
+    embedding_manager = EmbeddingManager(
+        placeholder_strings=['*'],
+        initializer_words=['plush', 'doll'],
+        per_image_tokens=False,
+        num_vectors_per_token=6,
+        progressive_words=False,
+        embedder=clip
+    ).to('mps')
 
-    modelCS.embedding_manager.load("/Users/birch/git/stable-diffusion/logs/2022-09-20T01-49-11_fumo/checkpoints/embeddings.pt")
+    embedding_manager.load('/Users/birch/git/stable-diffusion/logs/2022-09-20T01-49-11_fumo/checkpoints/embeddings.pt')
 
-    modelCS.get_learned_conditioning("")
+    clip.encode('', embedding_manager=embedding_manager)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
