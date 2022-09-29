@@ -1,5 +1,5 @@
 import torch
-from torch import nn
+from torch import nn, tensor
 
 from ldm.data.personalized import per_img_token_list
 from functools import partial
@@ -103,8 +103,9 @@ class EmbeddingManager(nn.Module):
         ckpt = torch.load(ckpt_path, map_location='cpu')
 
         # Handle .pt textual inversion files
+        # self.string_to_token_dict = { '*': tensor(265, device='cpu') }
         if 'string_to_token' in ckpt and 'string_to_param' in ckpt:
             self.string_to_token_dict = ckpt["string_to_token"]
-            self.string_to_param_dict = ckpt["string_to_param"]
+            # self.string_to_param_dict = ckpt["string_to_param"]
 
         print(f'Added terms: {", ".join(self.string_to_param_dict.keys())}')
