@@ -1,44 +1,8 @@
-from cmath import log
 import torch
 from torch import nn
 
-import sys
-
 from ldm.data.personalized import per_img_token_list
-from transformers import CLIPTokenizer
 from functools import partial
-
-DEFAULT_PLACEHOLDER_TOKEN = ['*']
-
-PROGRESSIVE_SCALE = 2000
-
-
-def get_clip_token_for_string(tokenizer, string):
-    batch_encoding = tokenizer(
-        string,
-        truncation=True,
-        max_length=77,
-        return_length=True,
-        return_overflowing_tokens=False,
-        padding='max_length',
-        return_tensors='pt',
-    )
-    tokens = batch_encoding['input_ids']
-    """ assert (
-        torch.count_nonzero(tokens - 49407) == 2
-    ), f"String '{string}' maps to more than a single token. Please use another string" """
-
-    return tokens[0, 1]
-
-
-def get_bert_token_for_string(tokenizer, string):
-    token = tokenizer(string)
-    # assert torch.count_nonzero(token) == 3, f"String '{string}' maps to more than a single token. Please use another string"
-
-    token = token[0, 1]
-
-    return token
-
 
 def get_embedding_for_clip_token(embedder, token):
     return embedder(token.unsqueeze(0))[0, 0]
@@ -135,15 +99,6 @@ class EmbeddingManager(nn.Module):
 
         assert False, "Okay, if you got this far then there's no problem. I simplified this function too much to return the right thing though, so let's abort."
 
-    def save(self, ckpt_path):
-        torch.save(
-            {
-                'string_to_token': self.string_to_token_dict,
-                'string_to_param': self.string_to_param_dict,
-            },
-            ckpt_path,
-        )
-
     def load(self, ckpt_path, full=True):
         ckpt = torch.load(ckpt_path, map_location='cpu')
 
@@ -152,49 +107,4 @@ class EmbeddingManager(nn.Module):
             self.string_to_token_dict = ckpt["string_to_token"]
             self.string_to_param_dict = ckpt["string_to_param"]
 
-        # Handle .bin textual inversion files from Huggingface Concepts
-        # https://huggingface.co/sd-concepts-library
-        else:
-            for token_str in list(ckpt.keys()):
-                token = get_clip_token_for_string(self.embedder.tokenizer, token_str)
-                self.string_to_token_dict[token_str] = token
-                ckpt[token_str] = torch.nn.Parameter(ckpt[token_str])
-                
-            self.string_to_param_dict.update(ckpt)
-
-        if not full:
-            for key, value in self.string_to_param_dict.items():
-                self.string_to_param_dict[key] = torch.nn.Parameter(value.half())
-
         print(f'Added terms: {", ".join(self.string_to_param_dict.keys())}')
-
-    def get_embedding_norms_squared(self):
-        all_params = torch.cat(
-            list(self.string_to_param_dict.values()), axis=0
-        )   # num_placeholders x embedding_dim
-        param_norm_squared = (all_params * all_params).sum(
-            axis=-1
-        )              # num_placeholders
-
-        return param_norm_squared
-
-    def embedding_parameters(self):
-        return self.string_to_param_dict.parameters()
-
-    def embedding_to_coarse_loss(self):
-
-        loss = 0.0
-        num_embeddings = len(self.initial_embeddings)
-
-        for key in self.initial_embeddings:
-            optimized = self.string_to_param_dict[key]
-            coarse = self.initial_embeddings[key].clone().to(optimized.device)
-
-            loss = (
-                loss
-                + (optimized - coarse)
-                @ (optimized - coarse).T
-                / num_embeddings
-            )
-
-        return loss
