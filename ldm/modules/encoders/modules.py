@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from transformers import CLIPTextModel
+from transformers.models.clip.modeling_clip import CLIPTextTransformer
+from transformers.models.clip.configuration_clip import CLIPTextConfig
 
 from ldm.modules.embedding_manager import EmbeddingManager
 
@@ -8,7 +9,8 @@ class FrozenCLIPEmbedder(nn.Module):
     """Uses the CLIP transformer encoder for text (from Hugging Face)"""
     def __init__(self, version="openai/clip-vit-large-patch14"):
         super().__init__()
-        self.transformer = CLIPTextModel.from_pretrained(version)
+        config = CLIPTextConfig.from_pretrained(version)
+        self.text_model = CLIPTextTransformer(config)
 
         def embedding_forward(
             self,
@@ -28,7 +30,7 @@ class FrozenCLIPEmbedder(nn.Module):
 
             self.position_embedding(position_ids)      
 
-        self.transformer.text_model.embeddings.forward = embedding_forward.__get__(self.transformer.text_model.embeddings)
+        self.text_model.embeddings.forward = embedding_forward.__get__(self.text_model.embeddings)
 
 
         def text_encoder_forward(
@@ -39,21 +41,7 @@ class FrozenCLIPEmbedder(nn.Module):
         ):
             self.embeddings(input_ids=input_ids, position_ids=position_ids, embedding_manager=embedding_manager)
 
-        self.transformer.text_model.forward = text_encoder_forward.__get__(self.transformer.text_model)
-
-        def transformer_forward(
-            self,
-            input_ids = None,
-            position_ids = None,
-            embedding_manager = None,
-        ):
-            return self.text_model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                embedding_manager = embedding_manager
-            )
-
-        self.transformer.forward = transformer_forward.__get__(self.transformer)
+        self.text_model.forward = text_encoder_forward.__get__(self.text_model)
 
     def repro(self, embedding_manager: EmbeddingManager):
-        self.transformer(input_ids=torch.cat([torch.tensor([49406], device='mps'), torch.tensor([49407], device='mps').expand(76)]).unsqueeze(0), embedding_manager=embedding_manager)
+        self.text_model(input_ids=torch.cat([torch.tensor([49406], device='mps'), torch.tensor([49407], device='mps').expand(76)]).unsqueeze(0), embedding_manager=embedding_manager)
