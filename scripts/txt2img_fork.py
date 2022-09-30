@@ -21,7 +21,7 @@ def main():
     embedding_manager.load('/Users/birch/git/stable-diffusion/logs/2022-09-20T01-49-11_fumo/checkpoints/embeddings.pt')
     # embedding_manager.load(filename)
 
-    clip.encode('', embedding_manager=embedding_manager)
+    clip.repro(embedding_manager=embedding_manager)
 
 
 if __name__ == '__main__':
