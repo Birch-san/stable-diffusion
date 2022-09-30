@@ -6,11 +6,6 @@ from ldm.modules.embedding_manager import EmbeddingManager
 def main():
     clip = FrozenCLIPEmbedder()
     embedding_manager = EmbeddingManager(
-        placeholder_strings=['*'],
-        initializer_words=['plush', 'doll'],
-        per_image_tokens=False,
-        num_vectors_per_token=6,
-        progressive_words=False,
         embedder=clip
     ).to('mps')
 

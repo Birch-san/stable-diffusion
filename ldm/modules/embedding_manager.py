@@ -1,23 +1,10 @@
 import torch
-from torch import nn, tensor
-
-from ldm.data.personalized import per_img_token_list
-from functools import partial
-
-def get_embedding_for_clip_token(embedder, token):
-    return embedder(token.unsqueeze(0))[0, 0]
-
+from torch import nn
 
 class EmbeddingManager(nn.Module):
     def __init__(
         self,
         embedder,
-        placeholder_strings=None,
-        initializer_words=None,
-        per_image_tokens=False,
-        num_vectors_per_token=1,
-        progressive_words=False,
-        **kwargs,
     ):
         super().__init__()
 
@@ -25,14 +12,9 @@ class EmbeddingManager(nn.Module):
 
         self.string_to_token_dict = {}
 
-        if per_image_tokens:
-            placeholder_strings.extend(per_img_token_list)
+        token = torch.tensor(265, device='mps')
 
-        for idx, placeholder_string in enumerate(placeholder_strings):
-
-            token = torch.tensor(265, device=embedder.device)
-
-            self.string_to_token_dict[placeholder_string] = token
+        self.string_to_token_dict['*'] = token
 
     def forward(
         self,
