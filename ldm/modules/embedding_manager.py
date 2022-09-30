@@ -24,64 +24,15 @@ class EmbeddingManager(nn.Module):
         self.embedder = embedder
 
         self.string_to_token_dict = {}
-        self.string_to_param_dict = nn.ParameterDict()
-
-        self.initial_embeddings = (
-            nn.ParameterDict()
-        )   # These should not be optimized
-
-        self.progressive_words = progressive_words
-        self.progressive_counter = 0
-
-        self.max_vectors_per_token = num_vectors_per_token
-
-        self.is_clip = True
-        get_token_for_string = lambda _: torch.tensor(265, device=embedder.device)
-        get_embedding_for_tkn = partial(
-            get_embedding_for_clip_token,
-            embedder.transformer.text_model.embeddings,
-        )
-        token_dim = 1280
 
         if per_image_tokens:
             placeholder_strings.extend(per_img_token_list)
 
         for idx, placeholder_string in enumerate(placeholder_strings):
 
-            token = get_token_for_string(placeholder_string)
-
-            if initializer_words and idx < len(initializer_words):
-                init_word_token = get_token_for_string(initializer_words[idx])
-
-                with torch.no_grad():
-                    init_word_embedding = get_embedding_for_tkn(
-                        init_word_token.cpu()
-                    )
-
-                token_params = torch.nn.Parameter(
-                    init_word_embedding.unsqueeze(0).repeat(
-                        num_vectors_per_token, 1
-                    ),
-                    requires_grad=True,
-                )
-                self.initial_embeddings[
-                    placeholder_string
-                ] = torch.nn.Parameter(
-                    init_word_embedding.unsqueeze(0).repeat(
-                        num_vectors_per_token, 1
-                    ),
-                    requires_grad=False,
-                )
-            else:
-                token_params = torch.nn.Parameter(
-                    torch.rand(
-                        size=(num_vectors_per_token, token_dim),
-                        requires_grad=True,
-                    )
-                )
+            token = torch.tensor(265, device=embedder.device)
 
             self.string_to_token_dict[placeholder_string] = token
-            self.string_to_param_dict[placeholder_string] = token_params
 
     def forward(
         self,
@@ -104,8 +55,5 @@ class EmbeddingManager(nn.Module):
 
         # Handle .pt textual inversion files
         # self.string_to_token_dict = { '*': tensor(265, device='cpu') }
-        if 'string_to_token' in ckpt and 'string_to_param' in ckpt:
+        if 'string_to_token' in ckpt:
             self.string_to_token_dict = ckpt["string_to_token"]
-            # self.string_to_param_dict = ckpt["string_to_param"]
-
-        print(f'Added terms: {", ".join(self.string_to_param_dict.keys())}')
