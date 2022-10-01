@@ -1,0 +1,249 @@
+## based on https://github.com/harubaru/waifu-diffusion/blob/main/danbooru_data/local/extractfromjson_danboo21.py
+## helps us play with waifu-diffusion 1.3 checkpoint by telling us what prompt we need to type
+## to align with what WD trained on for a given Danbooru caption
+## This script WAS NOT USED on the weights released by ProjectAI Touhou on 8th of september, 2022.
+## This script CAN convert tags to human-readable-text BUT IT IS NOT REQUIRED.
+
+import argparse
+
+#Stolen code from https://stackoverflow.com/a/43357954
+def str2bool(v):
+	if isinstance(v, bool):
+		return v
+	if v.lower() in ('yes', 'true', 't', 'y', '1'):
+		return True
+	elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+		return False
+	else:
+		raise argparse.ArgumentTypeError('Boolean value expected.')
+
+def ratingparsing(input):
+	v = input.lower()
+	ratingsSelected = " "
+	if "a" in v:
+		ratingsSelected = "e g q s"
+	if "e" in v:
+		ratingsSelected = ratingsSelected + "e "
+	if "g" in v:
+		ratingsSelected = ratingsSelected + "g "
+	if "q" in v:
+		ratingsSelected = ratingsSelected + "q "
+	if "s" in v:
+		ratingsSelected = ratingsSelected + "s "
+	if ratingsSelected == " ":
+		raise Exception('a/e/g/q/s expected')
+	print("Ratings selected: " + ratingsSelected)
+	return(ratingsSelected)
+## In the future someone might want to access this via import. Consider adding support for that
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--jsonpath', '-J', type=str, help='Path to JSONL file with the metadata', required = True)
+parser.add_argument('--extractpath', '-E', type=str, help='Path to the folder where to extract the images and text files', required = True)
+parser.add_argument('--imagespath', '-I', type=str, help='Path to the folder with the images', required = False, default="512px")
+parser.add_argument('--convtohuman', '-H', type=str2bool, help='Convert to human-readable-text', required = False, default=False)
+parser.add_argument('--rating', '-R', type=ratingparsing, help='Extract specific rating/s [a/e/g/q/s]', required = False, default='a')
+args = parser.parse_args()
+if args.convtohuman == True:
+	print("tag conversion to human is currently somewhat broken. If you still want to use it remove line 25")
+	#Q: What is broken?
+	#A: tag_separator sometimes appears at to_write without anything behind it. It should be an easy fix where tag_separator simply does not appear if the variable behind it is blank
+	#but right now its not important, plus many tokens are lost when converting to human text. its more effective doing tag based inputs rather than human-readable text
+	# exit()
+print("Arguments: " + str(args))
+
+import json
+
+#Converts tags to T2I-like prompts (blue_dress, 1girl -> A blue dress, one girl)
+
+def ConvCommaAndUnderscoreToHuman(convtohuman, input):
+	tars = input
+	if convtohuman:
+		tars = tars.replace(' ', ', ')
+		tars = tars.replace('_', ' ')
+	elif convtohuman == False:
+		print("CommaAndUnderscoreToHuman: convtohuman is false hence not doing anything")
+	return tars
+
+def ConvTagsToHuman(convtohuman, input):
+	tars = input
+	if convtohuman:
+		tars = tars.replace('1girl', 'one girl')
+		tars = tars.replace('2girls', 'two girls')
+		tars = tars.replace('3girls', 'three girls')
+		tars = tars.replace('4girls', 'four girls')
+		tars = tars.replace('5girls', 'five girls')
+		##Implying it will ever be able to differentiate so many entities
+		tars = tars.replace('6girls', 'six girls')
+
+		#Almost forgot about boys tags... I wonder if theres also for other entities?
+		tars = tars.replace('1boy', 'one boy')
+		tars = tars.replace('2boys', 'two boys')
+		tars = tars.replace('3boys', 'three boys')
+		tars = tars.replace('4boys', 'four boys')
+		tars = tars.replace('5boys', 'five boys')
+		tars = tars.replace('6boys', 'six boys')
+	elif convtohuman == False:
+		print("ConvTagsToHuman: convtohuman is false hence not doing anything")
+		print("TARS is: " + tars)
+	return tars
+
+#Converts ratings to X content
+def ConvRatingToHuman(convtohuman, input):
+	if convtohuman:
+		if input == "e":
+			return "explicit content"
+		if input == "g":
+			return "general content"
+		if input == "q":
+			return "questionable content"
+		if input == "s":
+			return "sensitive content"
+			##This will be the start of everything unethical
+	elif convtohuman == False:
+		if input == "e":
+			return "explicit_content"
+		if input == "g":
+			return "general_content"
+		if input == "q":
+			return "questionable_content"
+		if input == "s":
+			return "sensitive_content"
+
+def ConvCharacterToHuman(convtohuman, input):
+	tars = input
+	if convtohuman:
+		tars = tars.replace('_(', ' from ')
+		tars = tars.replace(')', '')
+	elif convtohuman == False:
+		print("ConvCharacterToHuman: convtohuman is false hence not doing anything")
+	return tars
+
+# unrecog_ans = True
+# while unrecog_ans:
+#     inputans = input("Convert tags to human-readable-text? (smiley_face blue_hair -> smiley face, blue hair) [y/n]")
+#     if inputans == "y":
+#         convtohuman = True
+#         unrecog_ans = False
+#     elif inputans == "n":
+#         convtohuman = False
+#         unrecog_ans = False
+#     else:
+#         print("unrecognizable input. only y or n.")
+#         unrecog_ans = True
+
+convtohuman = args.convtohuman
+acceptedRatings = args.rating
+
+##Open the file
+json_file_path = args.jsonpath ##Name of the JSON file to use, converted into parser arg
+with open(json_file_path, 'r', encoding="utf8") as json_file:
+	result = json.load(json_file)
+	
+	# try:
+	#     img_tags = result['tag_string']
+	# except Exception:
+	#     img_tags = "none"
+	#     print("failed to get img_tags")
+	#     continue
+
+	##JohannesGaessler SUGGESTIONS: harubaru/waifu-diffusion/pull/11
+
+		## TAG_STRING_GENERAL: ONLY TAGS HERE
+	try:
+		img_tag_string_general = result['tag_string_general']
+	except Exception:
+		img_tag_string_general = None
+		print("img_tag_string_general RETRIVAL FAILED. VAR IS ESSENTIAL SO SKIPPING ENTRY.")
+		pass
+
+		## TAG_STRING_ARTIST: ONLY ARTISTS TAGS HERE
+	try:
+		img_tag_string_artist = result['tag_string_artist']
+	except Exception:
+		img_tag_string_artist = None
+		print("img_tag_string_artist RETRIVAL FAILED. Var is not essential so just skipping var.")
+		pass
+
+		## TAG_STRING_COPYRIGHT: ONLY COPYRIGHT TAGS HERE
+	try:
+		img_tag_string_copyright = result['tag_string_copyright']
+	except Exception:
+		img_tag_string_copyright = None
+		print("img_tag_string_copyright RETRIVAL FAILED. Var is not essential so just skipping var.")
+		pass
+
+		## TAG_STRING_CHARACTER: ONLY CHARACTER TAGS HERE
+	try:
+		img_tag_string_character = result['tag_string_character']
+	except Exception:
+		img_tag_string_character = None
+		print("img_tag_string_character RETRIVAL FAILED. Var is not essential so just skipping var.")
+		pass
+
+	try:
+		img_rating = result['rating']
+	except Exception:
+		img_rating = None
+		print("img_rating RETRIVAL FAILED. VAR IS ESSENTIAL SO SKIPPING ENTRY.")
+		pass
+
+	baru = img_rating in acceptedRatings
+
+	# print("HEYYYYYYYYYYYYYYYY " + str(baru))
+
+	if str(baru) == "False":
+		print("Entry rating' is not in acceptedRatings, skipping entry.")
+		pass
+	elif str(baru) == "True":
+		print("Entry rating matches!")
+
+	##Essential
+	FinalTagStringGeneral = ConvCommaAndUnderscoreToHuman(convtohuman, img_tag_string_general)
+	FinalTagStringGeneral = ConvTagsToHuman(convtohuman, FinalTagStringGeneral)
+
+	##Not essential
+	if img_tag_string_artist != None:
+		FinalTagStringArtist = ConvCommaAndUnderscoreToHuman(convtohuman, img_tag_string_artist)
+	elif img_tag_string_artist == None:
+		print("img_tag_string_artist is none")
+	else:
+		print("CE 1NE")
+	
+	if img_tag_string_character != None:
+		FinalTagStringCharacter = ConvCommaAndUnderscoreToHuman(convtohuman, img_tag_string_character)
+		FinalTagStringCharacter = ConvCharacterToHuman(convtohuman, FinalTagStringCharacter)
+	elif img_tag_string_character == None:
+		print("img_tag_string_character is none")
+	else:
+		print("CE 2NE")
+
+	if img_tag_string_copyright != None:
+		FinalTagStringCopyright = ConvCommaAndUnderscoreToHuman(convtohuman, img_tag_string_copyright)
+	elif img_tag_string_copyright == None:
+		print("img_tag_string_copyright is none")
+	else:
+		print("CE 3NE")
+
+	print("IMAGE RATING IS: " + img_rating)
+
+	if img_rating != None:
+		FinalTagStringRating = ConvRatingToHuman(convtohuman, img_rating)
+	elif img_rating == None:
+		print("img_rating is none")
+	else:
+		print("CE 4NE")
+
+	if convtohuman == True:
+		dan_iden = 'uploaded on danbooru'
+		tag_separator = ', '
+	elif convtohuman == False:
+		dan_iden = 'danbooru'
+		tag_separator = ' '
+	# print('FinalTagStringCharacter is: ' + FinalTagStringCharacter)
+	# print('tag_separator is: ' + tag_separator)
+	# print('FinalTagStringArtist is: ' + FinalTagStringArtist)
+	# print('FinalTagStringRating is: ' + FinalTagStringRating)
+	# print('FinalTagStringGeneral is: ' + FinalTagStringGeneral)
+	# print('FinalTagStringCopyright is: ' + FinalTagStringCopyright)
+	to_write = FinalTagStringCharacter + tag_separator + FinalTagStringArtist + tag_separator + FinalTagStringRating + tag_separator + FinalTagStringGeneral + tag_separator + FinalTagStringCopyright
+	print(to_write)

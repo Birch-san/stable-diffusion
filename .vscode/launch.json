@@ -119,6 +119,22 @@
       "console": "integratedTerminal",
       "justMyCode": true,
       "args": []
+    },
+    {
+      "name": "Python: humanize booru caption",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/booru_caption_to_prompt.py",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--jsonpath",
+        "booru_caption.json",
+        "--convtohuman",
+        "True",
+        "--extractpath",
+        "outputs"
+      ]
     }
   ]
 }

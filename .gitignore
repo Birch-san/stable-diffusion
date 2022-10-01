@@ -11,5 +11,6 @@ __pycache__/
 /src/transformers/
 /*.png
 /*.pt
+/booru-caption.json
 /logs/
 /prompts.txt
