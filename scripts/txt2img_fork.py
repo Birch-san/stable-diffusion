@@ -1,13 +1,9 @@
 # from torch import save, load, tensor
 # from torch.nn import ParameterDict
-from ldm.modules.encoders.modules import FrozenCLIPEmbedder
 from ldm.modules.embedding_manager import EmbeddingManager
 
 def main():
-    clip = FrozenCLIPEmbedder()
-    embedding_manager = EmbeddingManager(
-        embedder=clip
-    )
+    embedding_manager = EmbeddingManager()
 
     # filename = 'test.pt'
     # save({
@@ -21,7 +17,7 @@ def main():
     embedding_manager.load('/Users/birch/git/stable-diffusion/logs/2022-09-20T01-49-11_fumo/checkpoints/embeddings.pt')
     # embedding_manager.load(filename)
 
-    clip.repro(embedding_manager=embedding_manager)
+    embedding_manager.repro()
 
 
 if __name__ == '__main__':

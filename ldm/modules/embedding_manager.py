@@ -1,13 +1,9 @@
 import torch
+from torch.nn import Embedding
 
 class EmbeddingManager():
-    def __init__(
-        self,
-        embedder,
-    ):
-        super().__init__()
-
-        self.embedder = embedder
+    def __init__(self):
+        self.token_embedding = Embedding(49408, 768, device='mps')
 
         self.string_to_token_dict = {}
 
@@ -15,11 +11,9 @@ class EmbeddingManager():
 
         self.string_to_token_dict['*'] = token
 
-    def forward(
-        self,
-        tokenized_text,
-        embedded_text,
-    ):
+    def repro(self):
+        tokenized_text = torch.cat([torch.tensor([49406], device='mps'), torch.tensor([49407], device='mps').expand(76)]).unsqueeze(0)
+        self.token_embedding(tokenized_text)
         placeholder_token = self.string_to_token_dict['*']
 
         cpu_item = placeholder_token.item()
