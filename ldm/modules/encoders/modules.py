@@ -15,4 +15,4 @@ class FrozenCLIPEmbedder():
         input_ids=torch.cat([torch.tensor([49406], device='mps'), torch.tensor([49407], device='mps').expand(76)]).unsqueeze(0)
 
         inputs_embeds = self.token_embedding(input_ids)
-        inputs_embeds = embedding_manager(input_ids, inputs_embeds)
+        inputs_embeds = embedding_manager.forward(input_ids, inputs_embeds)

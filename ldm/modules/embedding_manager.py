@@ -1,7 +1,6 @@
 import torch
-from torch import nn
 
-class EmbeddingManager(nn.Module):
+class EmbeddingManager():
     def __init__(
         self,
         embedder,

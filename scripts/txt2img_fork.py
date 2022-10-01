@@ -7,7 +7,7 @@ def main():
     clip = FrozenCLIPEmbedder()
     embedding_manager = EmbeddingManager(
         embedder=clip
-    ).to('mps')
+    )
 
     # filename = 'test.pt'
     # save({
