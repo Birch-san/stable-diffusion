@@ -124,10 +124,34 @@
       "name": "Python: corruption repro",
       "type": "python",
       "request": "launch",
-      "program": "${workspaceFolder}/scripts/corruption_repro.py",
+      "program": "${workspaceFolder}/corruption_repro.py",
       "console": "integratedTerminal",
       "justMyCode": false,
       "args": []
+    },
+    {
+      "name": "Python: train textual inversion",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "--base",
+        "./configs/stable-diffusion/v1-finetune.yaml",
+        "-t",
+        "--actual_resume",
+        "./models/ldm/stable-diffusion-v1/model.ckpt",
+        "-n",
+        "fumo8",
+        "--data_root",
+        "/Users/birch/plush/512_ti",
+        "--init_word",
+        "plush"
+      ],
+      "env": {
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1"
+      }
     },
   ]
 }
