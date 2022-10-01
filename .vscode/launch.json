@@ -119,6 +119,15 @@
       "console": "integratedTerminal",
       "justMyCode": true,
       "args": []
-    }
+    },
+    {
+      "name": "Python: corruption repro",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/corruption_repro.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": []
+    },
   ]
 }
