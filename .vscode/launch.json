@@ -103,7 +103,33 @@
         // "plush doll maiden of magic fire",
         // "--strength", "0.3",
         // "--f",
-        // "16"
+        // "16",
+        // "--embedding_path",
+        // "/Users/birch/git/stable-diffusion/logs/2022-09-20T01-49-11_fumo/checkpoints/embeddings.pt",
+      ],
+      "env": {
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1"
+      }
+    },
+    {
+      "name": "Python: train textual inversion",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "--base",
+        "./configs/stable-diffusion/v1-finetune.yaml",
+        "-t",
+        "--actual_resume",
+        "./models/ldm/stable-diffusion-v1/model.ckpt",
+        "-n",
+        "fumo8",
+        "--data_root",
+        "/Users/birch/plush/512_ti",
+        "--init_word",
+        "plush"
       ],
       "env": {
         "PYTORCH_ENABLE_MPS_FALLBACK": "1"
