@@ -62,6 +62,10 @@
       "console": "integratedTerminal",
       "justMyCode": true,
       "args": [
+        // "--ckpt",
+        // "/Users/birch/machine-learning/trinart_stable_diffusion_v2/trinart2_step115000.ckpt",
+        // "/Users/birch/machine-learning/waifu-diffusion/wd-v1-2-full-ema-pruned.ckpt",
+        // "/Users/birch/machine-learning/waifu-diffusion-v1-3/model-epoch04-float32.ckpt",
         "--prompt",
         // "Kunkka enjoys a nice coffee with Crystal Maiden. pixiv",
         // "masterpiece character portrait of a blonde girl, full resolution, 4 k, mizuryuu kei, akihiko. yoshida, Pixiv featured, baroque scenic, by artgerm, sylvain sarrailh, rossdraws, wlop, global illumination",
@@ -71,12 +75,12 @@
         // "masterpiece character portrait of a shrine maiden with long black hair, full resolution, 4k, mizuryuu kei, akihiko. yoshida, Pixiv featured, baroque scenic, by artgerm, sylvain sarrailh, rossdraws, wlop, global illumination, vaporwave",
         // "masterpiece character portrait of a shrine maiden, full resolution, 4k, mizuryuu kei, akihiko. yoshida, Pixiv featured, baroque scenic, by artgerm, sylvain sarrailh, rossdraws, wlop, global illumination, vaporwave",
         "--skip_grid",
-        // "--filename_prompt",
+        "--filename_prompt",
         // "--filename_sample_ix",
-        // "--filename_seed",
+        "--filename_seed",
         "--filename_sampling",
-        "--filename_sigmas",
         "--n_iter", "1",
+        // "--filename_sigmas",
         "--n_samples", "1",
         // "--steps", "50",
         // "--sampler", "plms",
@@ -84,9 +88,9 @@
         "--sampler", "heun",
         "--karras_noise",
         "--end_karras_ramp_early",
-        "--seed",
+        // "--seed",
         // "1396704121",
-        "68673924",
+        // "68673924",
         // "--scale",
         // "20",
         // "--dynamic_thresholding",
@@ -100,7 +104,10 @@
         // "--strength", "0.3",
         // "--f",
         // "16"
-      ]
+      ],
+      "env": {
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1"
+      }
     },
     {
       "name": "Python: threshold",
