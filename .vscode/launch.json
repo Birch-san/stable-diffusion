@@ -86,6 +86,7 @@
         // "--sampler", "plms",
         "--steps", "8",
         "--sampler", "heun",
+        // "--rho", "5.75",
         "--karras_noise",
         "--end_karras_ramp_early",
         // "--seed",

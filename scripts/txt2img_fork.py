@@ -465,6 +465,12 @@ def main():
         help=f"when --karras_noise is enabled: ramp from sigma_max (14.6146) to a sigma *slightly above* sigma_min (0.0292), instead of including sigma_min in our ramp. because the effect on the image of sampling sigma_min is not very big, and every sigma counts when our step counts are low. use this to get good results with {KARRAS_SAMPLERS} at step counts as low as 7 or 8.",
     )
     parser.add_argument(
+        "--rho",
+        type=float,
+        default=7.,
+        help=f"when --karras_noise is enabled: skew towards sampling from higher or lower sigmas. rho=10 samples more from low sigmas (<1.0); good for making faces coherent. rho=5 spends more time on high sigmas (>2.0); good for pose and body shape.",
+    )
+    parser.add_argument(
         "--dynamic_thresholding",
         action='store_true',
     )
@@ -916,7 +922,6 @@ def main():
                                     sigma_min = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
                                     return sigma_min
 
-                                rho = 7.
                                 # 14.6146
                                 sigma_max=model_k_wrapped.sigmas[-1].item()
                                 # 0.0292
@@ -927,13 +932,13 @@ def main():
                                     steps=opt.steps+1,
                                     sigma_max=sigma_max,
                                     sigma_min_nominal=sigma_min_nominal,
-                                    rho=rho
+                                    rho=opt.rho
                                 )
                                 sigmas = get_sigmas_karras(
                                     n=opt.steps,
                                     sigma_min=premature_sigma_min if opt.end_karras_ramp_early else sigma_min_nominal,
                                     sigma_max=sigma_max,
-                                    rho=rho,
+                                    rho=opt.rho,
                                     device=device,
                                 )
                                 karras_noise_active = True
