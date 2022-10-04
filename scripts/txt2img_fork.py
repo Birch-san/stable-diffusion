@@ -836,6 +836,7 @@ def main():
         assert opt.sampler in K_DIFF_SAMPLERS
         clip_model: OpenCLIP = open_clip.create_model('ViT-H-14', 'laion2b_s32b_b79k', device='mps')
         clip_model.requires_grad_(False)
+        # check whether this is supposed to normalize to OpenCLIP's distribution, or to LatentDiffusion's
         clip_normalize = transforms.Normalize(mean=clip_model.visual.image_mean, std=clip_model.visual.image_std)
         clip_size: Tuple[int, int] = clip_model.visual.image_size
         aug = KA.RandomAffine(0, (1/14, 1/14), p=1, padding_mode='border')
@@ -849,17 +850,20 @@ def main():
 
         def cond_fn_factory(target_embed: Tensor) -> CondFn:
             def cond_fn(x: Tensor, denoised: Tensor) -> Tensor:
-                a = model.decode_first_stage(denoised)
+                # rgb_images: List[Image.Image] = latents_to_pils(denoised)
+                decoded: Tensor = model.decode_first_stage(denoised)
+                # we didn't clamp, which might be a problem if CFG scaling is occurring? or maybe clip_normalize will save us
+                renormalized: Tensor = decoded.add(1).div(2)
                 # denoised is latents; need to decode it
-                image_embed: Tensor = get_image_embed(aug(denoised.add(1).div(2)))
+                image_embed: Tensor = get_image_embed(aug(renormalized))
                 loss: Tensor = spherical_dist_loss(image_embed, target_embed).sum() * opt.clip_guidance_scale
                 del image_embed
                 grad: Tensor = -torch.autograd.grad(loss, x)[0]
                 return grad
             return cond_fn
         
-        # model_k_guidance = make_cond_model_fn(model_k_guidance, cond_fn_factory)
-        # model_k_guidance = make_static_thresh_model_fn(model_k_guidance)
+        model_k_guidance = make_cond_model_fn(model_k_guidance, cond_fn_factory)
+        model_k_guidance = make_static_thresh_model_fn(model_k_guidance)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
