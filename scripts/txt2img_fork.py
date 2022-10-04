@@ -3,7 +3,7 @@ import cv2
 from cv2 import randn
 import torch
 import numpy as np
-from torch import Tensor, FloatTensor
+from torch import Tensor, FloatTensor, uint8
 from omegaconf import OmegaConf
 from PIL import Image
 from PIL.Image import Resampling
@@ -14,15 +14,21 @@ from einops import rearrange, repeat
 from torchvision.utils import make_grid
 import time
 from pytorch_lightning import seed_everything
-from torch import autocast, nn
+from torch import autocast, nn, enable_grad
+from torch.nn import functional as F
 from contextlib import contextmanager, nullcontext
 from random import randint
-from typing import Generic, Optional, Iterable, List, TypeAlias, Tuple, TypeVar, Callable
+from typing import Generic, Optional, Iterable, List, TypeAlias, Tuple, TypeVar, Callable, Protocol, TypedDict
 import re
 from ldm.models.diffusion.ddpm import LatentDiffusion
 import abc
 from dataclasses import dataclass
 from enum import Enum
+import open_clip
+from open_clip import CLIP as OpenCLIP
+from torchvision import transforms
+from resize_right import resize
+from kornia import augmentation as KA
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -30,6 +36,7 @@ from ldm.models.diffusion.plms import PLMSSampler
 
 from k_diffusion.sampling import sample_lms, sample_dpm_2, sample_dpm_2_ancestral, sample_euler, sample_euler_ancestral, sample_heun, sample_dpm_fast, sample_dpm_adaptive, get_sigmas_karras, append_zero
 from k_diffusion.external import CompVisDenoiser
+from k_diffusion.utils import append_dims
 
 def get_device():
     if(torch.cuda.is_available()):
@@ -39,6 +46,50 @@ def get_device():
     else:
         return 'cpu'
 
+class KSamplerCallbackPayload(TypedDict):
+    x: FloatTensor
+    i: int
+    sigma: FloatTensor
+    sigma_hat: FloatTensor
+    denoised: FloatTensor
+
+KSamplerCallback: TypeAlias = Callable[[KSamplerCallbackPayload], None]
+
+class DiffusionModel(Protocol):
+    def __call__(x: Tensor, sigma: Tensor, **kwargs) -> Tensor: ...
+
+class CondFn(Protocol):
+    def __call__(x: Tensor, denoised: Tensor) -> Tensor: ...
+
+class CondFnFactory(Protocol):
+    def __call__(target_embed: Tensor) -> CondFn: ...
+
+# def make_cond_fn() -> CondFn:
+#     pass 
+
+def make_cond_model_fn(model: DiffusionModel, cond_fn_factory: CondFnFactory) -> DiffusionModel:
+    @enable_grad()
+    def model_fn(x: Tensor, sigma: Tensor, target_embed: Tensor, **kwargs) -> Tensor:
+        x = x.detach().requires_grad_()
+        denoised: Tensor = model(x, sigma, **kwargs)
+        cond_fn: CondFn = cond_fn_factory(target_embed)
+        cond_grad: Tensor = cond_fn(x, denoised=denoised).detach()
+        ndim = x.ndim
+        del x
+        cond_denoised: Tensor = denoised.detach() + cond_grad * append_dims(sigma**2, ndim)
+        return cond_denoised
+    return model_fn
+
+def spherical_dist_loss(x: Tensor, y: Tensor) -> Tensor:
+    x = F.normalize(x, dim=-1)
+    y = F.normalize(y, dim=-1)
+    return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
+
+def make_static_thresh_model_fn(model: DiffusionModel, value=1.) -> DiffusionModel:
+    def model_fn(x: Tensor, sigma: Tensor, **kwargs) -> Tensor:
+        return model(x, sigma, **kwargs).clamp(-value, value)
+    return model_fn
+
 # samplers from the Karras et al paper
 PRE_KARRAS_K_DIFF_SAMPLERS = { 'k_lms', 'dpm2_ancestral', 'euler_ancestral' }
 KARRAS_SAMPLERS = { 'heun', 'euler', 'dpm2' }
@@ -47,9 +98,53 @@ K_DIFF_SAMPLERS = { *KARRAS_SAMPLERS, *PRE_KARRAS_K_DIFF_SAMPLERS, *DPM_SOLVER_S
 NOT_K_DIFF_SAMPLERS = { 'ddim', 'plms' }
 VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
 
+# lacks support for CFG (poorly named, right?)
 class KCFGDenoiser(nn.Module):
-    inner_model: CompVisDenoiser
-    def __init__(self, model: CompVisDenoiser):
+    inner_model: DiffusionModel
+    def __init__(self, model: DiffusionModel):
+        super().__init__()
+        self.inner_model = model
+
+    def forward(
+        self,
+        x: FloatTensor,
+        sigma: FloatTensor,
+        cond: FloatTensor,
+        **kwargs,
+    ) -> FloatTensor:
+        return self.inner_model(x, sigma, cond=cond)
+
+# lacks support for multi-cond
+class KCFGDenoiserSimple(nn.Module):
+    inner_model: DiffusionModel
+    def __init__(self, model: DiffusionModel):
+        super().__init__()
+        self.inner_model = model
+
+    def forward(
+        self,
+        x: FloatTensor,
+        sigma: FloatTensor,
+        cond: FloatTensor,
+        cond_scale: float = 1.0,
+        uncond: Optional[FloatTensor] = None,
+        **kwargs,
+    ) -> FloatTensor:
+        if uncond is None or cond_scale == 1.0:
+            return self.inner_model(x, sigma, cond=cond)
+        cond_in = torch.cat([uncond, cond])
+        del uncond, cond
+        x_in = repeat_along_dim_0(x, cond_in.size(dim=0))
+        del x
+        sigma_in = repeat_along_dim_0(sigma, cond_in.size(dim=0))
+        del sigma
+        uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(cond_in.size(dim=0))
+        del x_in, sigma_in, cond_in
+        return uncond + (cond - uncond) * cond_scale
+
+class KCFGDenoiserOrig(nn.Module):
+    inner_model: DiffusionModel
+    def __init__(self, model: DiffusionModel):
         super().__init__()
         self.inner_model = model
 
@@ -154,6 +249,25 @@ def numpy_to_pil(images):
     pil_images = [Image.fromarray(image) for image in images]
 
     return pil_images
+
+class LatentsToPils(Protocol):
+    def __call__(x: Tensor) -> Tensor: List[Image.Image]
+
+def make_latents_to_pils(model: LatentDiffusion) -> LatentsToPils:
+    def latents_to_pils(latents: Tensor) -> List[Image.Image]:
+        decoded: Tensor = model.decode_first_stage(latents)
+        clamped: Tensor = torch.clamp((decoded + 1.0) / 2.0, min=0.0, max=1.0)
+        del decoded
+        rearranged: Tensor = rearrange(clamped, 'b c h w -> b h w c')
+        del clamped
+        denormalized: Tensor = 255. * rearranged
+        del rearranged
+        rgb_images = denormalized.cpu().to(dtype=uint8).numpy()
+        del denormalized
+        pils: List[Image.Image] = [Image.fromarray(rgb_image) for rgb_image in rgb_images]
+        del rgb_images
+        return pils
+    return latents_to_pils
 
 def repeat_along_dim_0(t: Tensor, factor: int) -> Tensor:
     """
@@ -416,6 +530,13 @@ def main():
         help="the prompt to render. you can express your prompt as '0.5:piano villain' to halve its effect. negative numbers accepted. try multiple prompts with differing weights. --scale can be used to further amplify the difference between your summed prompts and the unconditional prompt."
     )
     parser.add_argument(
+        "--clip_prompt",
+        type=str,
+        nargs="?",
+        default=None,
+        help="alternative prompt upon which OpenCLIP should guide diffusion."
+    )
+    parser.add_argument(
         "--prompt_interpolation_steps",
         type=int,
         nargs="?",
@@ -509,6 +630,17 @@ def main():
         help=f"when using a Karras sampler ({KARRAS_SAMPLERS}): introduce noise on every sampling step. This gives the same 'creative' effect for which euler ancestral is famous. Currently lacks support for sigma_hat discretization (see https://github.com/crowsonkb/k-diffusion/pull/23).",
     )
     parser.add_argument(
+        "--openclip_version",
+        type=str,
+        default="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+        help="version of OpenCLIP to use",
+    )
+    parser.add_argument(
+        "--openclip_guidance",
+        action='store_true',
+        help="guides diffusion using OpenCLIP"
+    )
+    parser.add_argument(
         "--dynamic_thresholding",
         action='store_true',
     )
@@ -585,6 +717,12 @@ def main():
         type=float,
         default=7.5,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
+    )
+    parser.add_argument(
+        "--clip-guidance-scale",
+        type=float,
+        default=500.,
+        help="CLIP guidance scale",
     )
     parser.add_argument(
         "--from-file",
@@ -682,6 +820,8 @@ def main():
     device = torch.device(get_device())
     model = model.to(device)
 
+    latents_to_pils: LatentsToPils = make_latents_to_pils(model)
+
     if opt.sampler in K_DIFF_SAMPLERS:
         model_k_wrapped = CompVisDenoiser(model, quantize=True)
         model_k_guidance = KCFGDenoiser(model_k_wrapped)
@@ -690,7 +830,36 @@ def main():
             sampler = PLMSSampler(model)
         else:
             sampler = DDIMSampler(model)
-    
+
+    clip_model: Optional[OpenCLIP] = None
+    if opt.openclip_guidance:
+        assert opt.sampler in K_DIFF_SAMPLERS
+        clip_model: OpenCLIP = open_clip.create_model('ViT-H-14', 'laion2b_s32b_b79k', device='mps')
+        clip_model.requires_grad_(False)
+        clip_normalize = transforms.Normalize(mean=clip_model.visual.image_mean, std=clip_model.visual.image_std)
+        clip_size: Tuple[int, int] = clip_model.visual.image_size
+        aug = KA.RandomAffine(0, (1/14, 1/14), p=1, padding_mode='border')
+
+        def get_image_embed(x: Tensor) -> Tensor:
+            if x.shape[2:4] != clip_size:
+                x = resize(x, out_shape=clip_size, pad_mode='reflect')
+            x: Tensor = clip_normalize(x)
+            x: FloatTensor = clip_model.encode_image(x).float()
+            return F.normalize(x)
+
+        def cond_fn_factory(target_embed: Tensor) -> CondFn:
+            def cond_fn(x: Tensor, denoised: Tensor) -> Tensor:
+                a = model.decode_first_stage(denoised)
+                # denoised is latents; need to decode it
+                image_embed: Tensor = get_image_embed(aug(denoised.add(1).div(2)))
+                loss: Tensor = spherical_dist_loss(image_embed, target_embed).sum() * opt.clip_guidance_scale
+                del image_embed
+                grad: Tensor = -torch.autograd.grad(loss, x)[0]
+                return grad
+            return cond_fn
+        
+        # model_k_guidance = make_cond_model_fn(model_k_guidance, cond_fn_factory)
+        # model_k_guidance = make_static_thresh_model_fn(model_k_guidance)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
@@ -841,6 +1010,8 @@ def main():
                 cond_weights: Optional[Iterable[float]] = None
                 cond_arities: Optional[Iterable[int]] = None
                 sample_seeds: Optional[Iterable[int]] = None
+                # used only when CLIP guidance is enabled
+                target_embed: Optional[Tensor] = None
                 for n in trange(opt.n_iter, desc="Iterations"):
                     iter_tic = time.perf_counter()
                     for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch"):
@@ -877,6 +1048,14 @@ def main():
                                 case IdenticalSamplesBatchSpec(sample):
                                     # for some reason Python isn't narrowing the type automatically
                                     sample: SampleSpec = sample
+                                    if opt.openclip_guidance:
+                                        assert batch_size == 1, "CLIP guidance only implemented for single-sample, single-condition scenario"
+                                        assert len(sample.multiprompt) == 1, "CLIP guidance only implemented for single-sample, single-condition scenario"
+                                        tokens: Tensor = open_clip.tokenize(opt.clip_prompt or sample.multiprompt[0].text).to(device)
+                                        encoded: Tensor = clip_model.encode_text(tokens).to(device)
+                                        del tokens
+                                        target_embed: Tensor = F.normalize(encoded.float())
+                                        del encoded
                                     texts: List[str] = [subprompt.text for subprompt in sample.multiprompt]
                                     cond_arities: Tuple[int, ...] = (len(texts),) * batch_size
                                     cond_weights: List[float] = [subprompt.weight for subprompt in sample.multiprompt] * batch_size
@@ -884,6 +1063,7 @@ def main():
                                     c = repeat_along_dim_0(p, batch_size)
                                     del p
                                 case VariedSamplesBatchSpec(samples):
+                                    assert not opt.openclip_guidance, "CLIP guidance only implemented for single-sample, single-condition scenario"
                                     # for some reason Python isn't narrowing the type automatically
                                     samples: List[SampleSpec] = samples
                                     assert len(samples) == batch_size
@@ -1008,74 +1188,80 @@ def main():
                                 'cond_weights': cond_weights,
                                 'cond_arities': cond_arities,
                                 'cond_scale': opt.scale,
+                                'target_embed': target_embed,
                             }
-                            samples = sampling_fn(
+
+                            def log_intermediate(payload: KSamplerCallbackPayload) -> None:
+                                sample_pils: List[Image.Image] = latents_to_pils(payload['denoised'])
+                                for img in sample_pils:
+                                    img.save(os.path.join(sample_path, f"inter.{payload['i']}.png"))
+
+                            samples: Tensor = sampling_fn(
                                 model_k_guidance,
                                 x,
                                 extra_args=extra_args,
+                                callback=log_intermediate,
                                 **noise_schedule_sampler_args)
 
-                        x_samples = model.decode_first_stage(samples)
+                        rgb_images: List[Image.Image] = latents_to_pils(samples)
+                        # x_samples = model.decode_first_stage(samples)
 
-                        if opt.dynamic_thresholding:
-                            # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
-                            # adapted from lucidrains' imagen_pytorch (MIT-licensed)
-                            flattened = rearrange(x_samples, 'a b ... -> a b (...)').abs()
-                            # aten::sort.values_stable not implemented for MPS
-                            sort_on_cpu = device.type == 'mps'
-                            flattened = flattened.cpu() if sort_on_cpu else flattened
-                            # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
-                            s = torch.quantile(
-                                flattened,
-                                opt.dynamic_thresholding_percentile,
-                                dim = 2
-                            )
-                            s = s.to(device) if sort_on_cpu else s
-                            s.clamp_(min = 1.)
-                            s = right_pad_dims_to(x_samples, s)
-                            # MPS complains min and input tensors must be of the same shape
+                        # if opt.dynamic_thresholding:
+                        #     # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
+                        #     # adapted from lucidrains' imagen_pytorch (MIT-licensed)
+                        #     flattened = rearrange(x_samples, 'a b ... -> a b (...)').abs()
+                        #     # aten::sort.values_stable not implemented for MPS
+                        #     sort_on_cpu = device.type == 'mps'
+                        #     flattened = flattened.cpu() if sort_on_cpu else flattened
+                        #     # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
+                        #     s = torch.quantile(
+                        #         flattened,
+                        #         opt.dynamic_thresholding_percentile,
+                        #         dim = 2
+                        #     )
+                        #     s = s.to(device) if sort_on_cpu else s
+                        #     s.clamp_(min = 1.)
+                        #     s = right_pad_dims_to(x_samples, s)
+                        #     # MPS complains min and input tensors must be of the same shape
 
-                            clamp_tensors_on_cpu = device.type == 'mps'
-                            s_orig = s
-                            neg_s = -s
-                            s = s.cpu() if clamp_tensors_on_cpu else s
-                            neg_s = neg_s.cpu() if clamp_tensors_on_cpu else neg_s
-                            x_samples = x_samples.cpu() if clamp_tensors_on_cpu else x_samples
-                            x_samples = x_samples.clamp(neg_s, s)
-                            x_samples = x_samples.to(device) if clamp_tensors_on_cpu else x_samples
-                            x_samples = x_samples / s_orig
+                        #     clamp_tensors_on_cpu = device.type == 'mps'
+                        #     s_orig = s
+                        #     neg_s = -s
+                        #     s = s.cpu() if clamp_tensors_on_cpu else s
+                        #     neg_s = neg_s.cpu() if clamp_tensors_on_cpu else neg_s
+                        #     x_samples = x_samples.cpu() if clamp_tensors_on_cpu else x_samples
+                        #     x_samples = x_samples.clamp(neg_s, s)
+                        #     x_samples = x_samples.to(device) if clamp_tensors_on_cpu else x_samples
+                        #     x_samples = x_samples / s_orig
                         
-                        x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
-                        x_samples = x_samples.cpu().permute(0, 2, 3, 1).numpy()
+                        # x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+                        # x_samples = x_samples.cpu().permute(0, 2, 3, 1).numpy()
 
-                        x_checked_image, has_nsfw_concept = check_safety_poorly(x_samples)
+                        # x_checked_image, has_nsfw_concept = check_safety_poorly(x_samples)
 
-                        x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
+                        # x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2)
 
                         if not opt.skip_save:
-                            for x_sample, sample_seed in zip(x_checked_image_torch, sample_seeds):
-                                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                                img = Image.fromarray(x_sample.astype(np.uint8))
+                            for img, sample_seed in zip(rgb_images, sample_seeds):
                                 # img = put_watermark(img, wm_encoder)
                                 preferred_sigmas = sigmas_quantized if sigmas_quantized is not None else sigmas
                                 img.save(os.path.join(sample_path, compute_sample_file_name(sample_seed=sample_seed, sigmas=format_sigmas_pretty(preferred_sigmas, summary=True) if preferred_sigmas is not None else None)))
                                 base_count += 1
 
                         if not opt.skip_grid:
-                            all_samples.append(x_checked_image_torch)
+                            all_samples.extend(rgb_images)
                     iter_toc = time.perf_counter()
                     print(f'batch {n} generated {batch_size} images in {iter_toc-iter_tic} seconds')
                 if not opt.skip_grid:
                     # additionally, save as grid
-                    grid = torch.stack(all_samples, 0)
-                    grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-                    grid = make_grid(grid, nrow=n_rows)
+                    # grid = torch.stack(all_samples, 0)
+                    # grid = rearrange(grid, 'n b c h w -> (n b) c h w')
+                    # grid = make_grid(grid, nrow=n_rows)
 
-                    # to image
-                    grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-                    img = Image.fromarray(grid.astype(np.uint8))
-                    # img = put_watermark(img, wm_encoder)
-                    img.save(os.path.join(outpath, compute_batch_file_name(sigmas=format_sigmas_pretty(preferred_sigmas, summary=True))))
+                    # # to image
+                    # grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
+                    # img = Image.fromarray(grid.astype(np.uint8))
+                    # img.save(os.path.join(outpath, compute_batch_file_name(sigmas=format_sigmas_pretty(preferred_sigmas, summary=True))))
                     grid_count += 1
 
                 toc = time.perf_counter()
