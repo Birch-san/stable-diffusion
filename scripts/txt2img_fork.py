@@ -797,13 +797,16 @@ def main():
     if opt.openclip_guidance:
         assert opt.sampler in K_DIFF_SAMPLERS
         clip_model: OpenCLIP = open_clip.create_model('ViT-H-14', 'laion2b_s32b_b79k', device='mps')
+        # clip_model, _, clip_val_preprocess = open_clip.create_model_and_transforms('ViT-H-14', 'laion2b_s32b_b79k', device='mps')
         clip_model.requires_grad_(False)
-        # check whether this is supposed to normalize to OpenCLIP's distribution, or to LatentDiffusion's
+        # TODO: check whether this is supposed to normalize to OpenCLIP's distribution, or to LatentDiffusion's
+        #       or maybe we can just switch to clip_val_preprocess
         clip_normalize = transforms.Normalize(mean=clip_model.visual.image_mean, std=clip_model.visual.image_std)
         clip_size: Tuple[int, int] = clip_model.visual.image_size
         aug = KA.RandomAffine(0, (1/14, 1/14), p=1, padding_mode='border')
 
         def get_image_embed(x: Tensor) -> Tensor:
+            # TODO: should we replace this resize+normalize with clip_val_preprocess(x)?
             if x.shape[2:4] != clip_size:
                 x = resize(x, out_shape=clip_size, pad_mode='reflect')
             x: Tensor = clip_normalize(x)
@@ -812,14 +815,18 @@ def main():
 
         def cond_fn_factory(target_embed: Tensor) -> CondFn:
             def cond_fn(x: Tensor, denoised: Tensor) -> Tensor:
-                # rgb_images: List[Image.Image] = latents_to_pils(denoised)
-                decoded: Tensor = model.decode_first_stage(denoised)
-                # we didn't clamp, which might be a problem if CFG scaling is occurring? or maybe clip_normalize will save us
+                decoded: Tensor = model.differentiable_decode_first_stage(denoised)
+                del denoised
+                # TODO: clamp (especially if there's CFG guidance)
                 renormalized: Tensor = decoded.add(1).div(2)
-                # denoised is latents; need to decode it
-                image_embed: Tensor = get_image_embed(aug(renormalized))
+                del decoded
+                # TODO: do we need to run augmentations on the image, or is that just for training?
+                image_embed: Tensor = get_image_embed(renormalized)
+                del renormalized
+                # TODO: does this do the right thing for multi-sample?
                 loss: Tensor = spherical_dist_loss(image_embed, target_embed).sum() * opt.clip_guidance_scale
                 del image_embed
+                # TODO: does this do the right thing for multi-sample?
                 grad: Tensor = -torch.autograd.grad(loss, x)[0]
                 return grad
             return cond_fn
