@@ -66,7 +66,9 @@
         // "/Users/birch/machine-learning/trinart_stable_diffusion_v2/trinart2_step115000.ckpt",
         // "/Users/birch/machine-learning/waifu-diffusion/wd-v1-2-full-ema-pruned.ckpt",
         // "/Users/birch/machine-learning/waifu-diffusion-v1-3/model-epoch04-float32.ckpt",
-        // "--openclip_guidance",
+        "--clip_guidance",
+        "--clip-guidance-scale", "100",
+        // "--clip_augmentations",
         "--prompt",
         "photo of a plush teddy bear",
         "--clip_prompt",
@@ -173,6 +175,25 @@
         "--extractpath",
         "outputs"
       ]
-    }
+    },
+    {
+      "name": "Python: k-diff CLIP guidance",
+      "type": "python",
+      "request": "launch",
+      "program": "sample_clip_guided.py",
+      "cwd": "${workspaceFolder}/src/k-diffusion",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "args": [
+        "--batch-size", "1",
+        "--config", "configs/config_32x32_small_butterflies.json",
+        "-n", "1",
+        "--steps", "8",
+        "photo of a red plush teddy bear sitting on a windowsill at night holding a glass of wine"
+      ],
+      "env": {
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1"
+      }
+    },
   ]
 }

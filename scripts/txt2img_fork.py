@@ -29,6 +29,7 @@ from open_clip import CLIP as OpenCLIP
 from torchvision import transforms
 from resize_right import resize
 from kornia import augmentation as KA
+from inspect import currentframe
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -45,6 +46,10 @@ def get_device():
         return 'mps'
     else:
         return 'cpu'
+
+def stat(t: Tensor) -> str:
+	frameinfo = currentframe()
+	return "%s: min: %.3f, max: %.3f, std: %.3f, %s" % (frameinfo.f_back.f_lineno, t.min().item(), t.max().item(), t.std().item(), list(t.shape))
 
 class KSamplerCallbackPayload(TypedDict):
     x: FloatTensor
@@ -592,15 +597,36 @@ def main():
         help=f"when --karras_noise is enabled: skew towards sampling from higher or lower sigmas. rho=10 samples more from low sigmas (<1.0); good for making faces coherent. rho=5 spends more time on high sigmas (>2.0); good for pose and body shape.",
     )
     parser.add_argument(
-        "--openclip_version",
-        type=str,
-        default="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
-        help="version of OpenCLIP to use",
+        "--clip_guidance",
+        action='store_true',
+        help="CLIP-guided diffusion (via OpenCLIP)"
     )
     parser.add_argument(
-        "--openclip_guidance",
+        "--clip_augmentations",
         action='store_true',
-        help="guides diffusion using OpenCLIP"
+        help="CLIP-guided diffusion will compute embedding from a subtly-transformed copy of the denoised latents instead of the real thing"
+    )
+    parser.add_argument(
+        "--clip_model_name",
+        type=str,
+        default="ViT-B-32",
+        # big:
+        # --clip_model_name "ViT-H-14" --clip_model_version "laion2b_s32b_b79k"
+        # less big:
+        # --clip_model_name "ViT-B-32" --clip_model_version "laion2b_s34b_b79k"
+        # the big one is slow on Mac (30s/it) and the bear it generated looked worse
+        help="CLIP model name passed to OpenCLIP",
+    )
+    parser.add_argument(
+        "--clip_model_version",
+        type=str,
+        default="laion2b_s34b_b79k",
+        # big:
+        # --clip_model_name "ViT-H-14" --clip_model_version "laion2b_s32b_b79k"
+        # less big:
+        # --clip_model_name "ViT-B-32" --clip_model_version "laion2b_s34b_b79k"
+        # the big one is slow on Mac (30s/it) and the bear it generated looked worse
+        help="CLIP checkpoint name passed to OpenCLIP",
     )
     parser.add_argument(
         "--dynamic_thresholding",
@@ -794,36 +820,47 @@ def main():
             sampler = DDIMSampler(model)
 
     clip_model: Optional[OpenCLIP] = None
-    if opt.openclip_guidance:
+    if opt.clip_guidance:
         assert opt.sampler in K_DIFF_SAMPLERS
-        clip_model: OpenCLIP = open_clip.create_model('ViT-H-14', 'laion2b_s32b_b79k', device='mps')
-        # clip_model, _, clip_val_preprocess = open_clip.create_model_and_transforms('ViT-H-14', 'laion2b_s32b_b79k', device='mps')
+        clip_model: OpenCLIP = open_clip.create_model(opt.clip_model_name, opt.clip_model_version, device=device)
         clip_model.requires_grad_(False)
-        # TODO: check whether this is supposed to normalize to OpenCLIP's distribution, or to LatentDiffusion's
-        #       or maybe we can just switch to clip_val_preprocess
         clip_normalize = transforms.Normalize(mean=clip_model.visual.image_mean, std=clip_model.visual.image_std)
         clip_size: Tuple[int, int] = clip_model.visual.image_size
         aug = KA.RandomAffine(0, (1/14, 1/14), p=1, padding_mode='border')
 
         def get_image_embed(x: Tensor) -> Tensor:
-            # TODO: should we replace this resize+normalize with clip_val_preprocess(x)?
             if x.shape[2:4] != clip_size:
-                x = resize(x, out_shape=clip_size, pad_mode='reflect')
+                # k-diffusion example used a bicubic resize
+                # x = resize(x, out_shape=clip_size, pad_mode='reflect')
+                # but diffusers' bilinear resize produced a nicer bear
+                x = transforms.Resize(clip_size)(x)
             x: Tensor = clip_normalize(x)
             x: FloatTensor = clip_model.encode_image(x).float()
+
             return F.normalize(x)
 
         def cond_fn_factory(target_embed: Tensor) -> CondFn:
             def cond_fn(x: Tensor, denoised: Tensor) -> Tensor:
                 decoded: Tensor = model.differentiable_decode_first_stage(denoised)
                 del denoised
-                # TODO: clamp (especially if there's CFG guidance)
                 renormalized: Tensor = decoded.add(1).div(2)
                 del decoded
-                # TODO: do we need to run augmentations on the image, or is that just for training?
-                image_embed: Tensor = get_image_embed(renormalized)
+                clamped: Tensor = renormalized.clamp(0, 1)
                 del renormalized
+                if opt.clip_augmentations:
+                    # this particular approach to augmentation crashes on MPS, so we transfer to CPU (for now)
+                    # :27:11: error: invalid input tensor shapes, indices shape and updates shape must be equal
+                    # -:27:11: note: see current operation: %25 = "mps.scatter_along_axis"(%23, %arg3, %24, %1) {mode = 6 : i32} : (tensor<786432xf32>, tensor<512xf32>, tensor<262144xi32>, tensor<i32>) -> tensor<786432xf32>
+                    # TODO: this approach (from k-diffusion example) produces just the one augmentation,
+                    #       whereas diffusers approach is to use many and sum their losses. should we?
+                    clamped = aug(clamped.cpu()).to(device) if device.type == 'mps' else aug(clamped)
+                image_embed: Tensor = get_image_embed(clamped)
+                del clamped
                 # TODO: does this do the right thing for multi-sample?
+                # TODO: do we want .mean() here or .sum()? or both?
+                #       k-diffusion example used just .sum(), but k-diff was single-aug. maybe that was for multi-sample?
+                #       whereas diffusers uses .mean() (this seemed to be over a single number, but maybe when you have multiple samples it becomes the mean of the loss over your n samples?),
+                #       then uses sum() (which for multi-aug would sum the losses of each aug)
                 loss: Tensor = spherical_dist_loss(image_embed, target_embed).sum() * opt.clip_guidance_scale
                 del image_embed
                 # TODO: does this do the right thing for multi-sample?
@@ -832,7 +869,10 @@ def main():
             return cond_fn
         
         model_k_guidance = make_cond_model_fn(model_k_guidance, cond_fn_factory)
-        model_k_guidance = make_static_thresh_model_fn(model_k_guidance)
+        # static thresholding on every step makes the bear look like cornflakes.
+        # we don't need it at low scales (e.g. 100), because latents don't clip to badly (pun intended)
+        # TODO: try dynamic thresholding (on every sampler step, not the silly one-shot approach I commented-out elsewhere)
+        # model_k_guidance = make_static_thresh_model_fn(model_k_guidance)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
@@ -1021,7 +1061,7 @@ def main():
                                 case IdenticalSamplesBatchSpec(sample):
                                     # for some reason Python isn't narrowing the type automatically
                                     sample: SampleSpec = sample
-                                    if opt.openclip_guidance:
+                                    if opt.clip_guidance:
                                         assert batch_size == 1, "CLIP guidance only implemented for single-sample, single-condition scenario"
                                         assert len(sample.multiprompt) == 1, "CLIP guidance only implemented for single-sample, single-condition scenario"
                                         tokens: Tensor = open_clip.tokenize(opt.clip_prompt or sample.multiprompt[0].text).to(device)
@@ -1036,7 +1076,7 @@ def main():
                                     c = repeat_along_dim_0(p, batch_size)
                                     del p
                                 case VariedSamplesBatchSpec(samples):
-                                    assert not opt.openclip_guidance, "CLIP guidance only implemented for single-sample, single-condition scenario"
+                                    assert not opt.clip_guidance, "CLIP guidance only implemented for single-sample, single-condition scenario"
                                     # for some reason Python isn't narrowing the type automatically
                                     samples: List[SampleSpec] = samples
                                     assert len(samples) == batch_size
