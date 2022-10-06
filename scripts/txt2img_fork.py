@@ -29,6 +29,7 @@ from open_clip import CLIP as OpenCLIP
 from torchvision import transforms
 from resize_right import resize
 from kornia import augmentation as KA
+from inspect import currentframe
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -45,6 +46,10 @@ def get_device():
         return 'mps'
     else:
         return 'cpu'
+
+def stat(t: Tensor) -> str:
+	frameinfo = currentframe()
+	return "%s: min: %.3f, max: %.3f, std: %.3f, %s" % (frameinfo.f_back.f_lineno, t.min().item(), t.max().item(), t.std().item(), list(t.shape))
 
 class KSamplerCallbackPayload(TypedDict):
     x: FloatTensor
@@ -71,12 +76,16 @@ def make_cond_model_fn(model: DiffusionModel, cond_fn_factory: CondFnFactory) ->
     @enable_grad()
     def model_fn(x: Tensor, sigma: Tensor, target_embed: Tensor, **kwargs) -> Tensor:
         x = x.detach().requires_grad_()
+        print(stat(x)) # min: -61.731, max: 58.223, std: 14.773, [1, 4, 64, 64]
         denoised: Tensor = model(x, sigma, **kwargs)
+        print(stat(denoised)) # min: -0.629, max: 1.099, std: 0.265, [1, 4, 64, 64]
         cond_fn: CondFn = cond_fn_factory(target_embed)
         cond_grad: Tensor = cond_fn(x, denoised=denoised).detach()
+        print(stat(cond_grad)) # min: -0.057, max: 0.038, std: 0.010, [1, 4, 64, 64]
         ndim = x.ndim
         del x
         cond_denoised: Tensor = denoised.detach() + cond_grad * append_dims(sigma**2, ndim)
+        print(stat(cond_denoised)) # min: -11.322, max: 7.676, std: 2.160, [1, 4, 64, 64]
         return cond_denoised
     return model_fn
 
@@ -635,6 +644,12 @@ def main():
         default="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
         help="version of OpenCLIP to use",
     )
+    # parser.add_argument(
+    #     "--openclip_version",
+    #     type=str,
+    #     default="laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+    #     help="version of OpenCLIP to use",
+    # )
     parser.add_argument(
         "--openclip_guidance",
         action='store_true',
@@ -834,7 +849,8 @@ def main():
     clip_model: Optional[OpenCLIP] = None
     if opt.openclip_guidance:
         assert opt.sampler in K_DIFF_SAMPLERS
-        clip_model: OpenCLIP = open_clip.create_model('ViT-H-14', 'laion2b_s32b_b79k', device='mps')
+        # clip_model: OpenCLIP = open_clip.create_model('ViT-H-14', 'laion2b_s32b_b79k', device='mps')
+        clip_model: OpenCLIP = open_clip.create_model('ViT-B-32', 'laion2b_s34b_b79k', device='mps')
         # clip_model, _, clip_val_preprocess = open_clip.create_model_and_transforms('ViT-H-14', 'laion2b_s32b_b79k', device='mps')
         clip_model.requires_grad_(False)
         # TODO: check whether this is supposed to normalize to OpenCLIP's distribution, or to LatentDiffusion's
@@ -844,33 +860,67 @@ def main():
         aug = KA.RandomAffine(0, (1/14, 1/14), p=1, padding_mode='border')
 
         def get_image_embed(x: Tensor) -> Tensor:
+            print(stat(x)) # min: 0.097, max: 0.779, std: 0.149, [1, 3, 512, 512]
             # TODO: should we replace this resize+normalize with clip_val_preprocess(x)?
             if x.shape[2:4] != clip_size:
-                x = resize(x, out_shape=clip_size, pad_mode='reflect')
+                # x = resize(x, out_shape=clip_size, pad_mode='reflect')
+                # switch to same resize impl as HF so that tensors can be compared
+                x = transforms.Resize(clip_size)(x)
+            print(stat(x)) # min: 0.108, max: 0.771, std: 0.149, [1, 3, 224, 224]
             x: Tensor = clip_normalize(x)
+            print(stat(x)) # min: -1.104, max: 1.079, std: 0.497, [1, 3, 224, 224]
             x: FloatTensor = clip_model.encode_image(x).float()
-            return F.normalize(x)
+            print(stat(x)) # min: -5.239, max: 5.220, std: 0.528, [1, 512]
+
+            f = F.normalize(x)
+            print(stat(f)) # min: -0.439, max: 0.437, std: 0.044, [1, 512]
+
+            # 00048: F.normalize way (k-diff) 
+            # 00049: x/x.norm() way (diffusers)
+            # return F.normalize(x)
+            n = x.norm(p=2, dim=-1, keepdim=True)
+            print(stat(n)) # min: 11.943, max: 11.943, std: nan, [1, 1]
+            x: FloatTensor = x / n
+            print(stat(x)) # min: -0.439, max: 0.437, std: 0.044, [1, 512]
+            return x
 
         def cond_fn_factory(target_embed: Tensor) -> CondFn:
             def cond_fn(x: Tensor, denoised: Tensor) -> Tensor:
+                print(stat(x)) # min: -61.731, max: 58.223, std: 14.773, [1, 4, 64, 64]
+                print(stat(denoised)) # min: -0.629, max: 1.099, std: 0.265, [1, 4, 64, 64]
+                # according to https://colab.research.google.com/github/huggingface/notebooks/blob/main/diffusers/CLIP_Guided_Stable_diffusion_with_diffusers.ipynb#scrollTo=-bzXx-2EhlQY
+                # perhaps we are missing
+                # sample = denoised - sigma * x # no
+                # sample = 1 / 0.18215 * sample # no
+                # decoded: Tensor = model.differentiable_decode_first_stage(sample)
                 decoded: Tensor = model.differentiable_decode_first_stage(denoised)
                 del denoised
-                # TODO: clamp (especially if there's CFG guidance)
+                print(stat(decoded)) # min: -0.807, max: 0.557, std: 0.297, [1, 3, 512, 512]
                 renormalized: Tensor = decoded.add(1).div(2)
                 del decoded
-                # TODO: do we need to run augmentations on the image, or is that just for training?
-                image_embed: Tensor = get_image_embed(renormalized)
+                print(stat(renormalized)) # min: 0.097, max: 0.779, std: 0.149, [1, 3, 512, 512]
+                clamped: Tensor = renormalized.clamp(0, 1)
                 del renormalized
+                print(stat(clamped)) # min: 0.097, max: 0.779, std: 0.149, [1, 3, 512, 512]
+                # TODO: do we need to run augmentations on the image, or is that just for training?
+                image_embed: Tensor = get_image_embed(clamped)
+                # image_embed: Tensor = clip_val_preprocess(clamped)
+                del clamped
+                print(stat(image_embed)) # min: -0.439, max: 0.437, std: 0.044, [1, 512]
                 # TODO: does this do the right thing for multi-sample?
-                loss: Tensor = spherical_dist_loss(image_embed, target_embed).sum() * opt.clip_guidance_scale
+                l: Tensor = spherical_dist_loss(image_embed, target_embed) # 0.9624
+                m: Tensor = l.mean() # 0.9624
+                # loss: Tensor = spherical_dist_loss(image_embed, target_embed).mean() * opt.clip_guidance_scale
+                loss: Tensor = m * opt.clip_guidance_scale # 96.2410
                 del image_embed
                 # TODO: does this do the right thing for multi-sample?
                 grad: Tensor = -torch.autograd.grad(loss, x)[0]
+                print(stat(grad)) # min: -0.057, max: 0.038, std: 0.010, [1, 4, 64, 64]
                 return grad
             return cond_fn
         
         model_k_guidance = make_cond_model_fn(model_k_guidance, cond_fn_factory)
-        model_k_guidance = make_static_thresh_model_fn(model_k_guidance)
+        # model_k_guidance = make_static_thresh_model_fn(model_k_guidance)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
