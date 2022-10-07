@@ -1,4 +1,4 @@
-import argparse, os, sys, glob
+import argparse, os, sys, glob, fnmatch
 import cv2
 from cv2 import randn
 import torch
@@ -988,9 +988,11 @@ def main():
         ]
 
     sample_path = os.path.join(outpath, "samples")
+    intermediates_path = os.path.join(outpath, "intermediates")
     os.makedirs(sample_path, exist_ok=True)
-    base_count = len(os.listdir(sample_path))
-    grid_count = len(os.listdir(outpath)) - 1
+    os.makedirs(intermediates_path, exist_ok=True)
+    base_count = len(fnmatch.filter(os.listdir(sample_path), f"{5*'[0-9]'}.*.png"))
+    grid_count = len(fnmatch.filter(os.listdir(outpath), f"grid-{4*'[0-9]'}.*.png"))
 
     shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
 
@@ -1258,7 +1260,7 @@ def main():
                             def log_intermediate(payload: KSamplerCallbackPayload) -> None:
                                 sample_pils: List[Image.Image] = latents_to_pils(payload['denoised'])
                                 for img in sample_pils:
-                                    img.save(os.path.join(sample_path, f"inter.{payload['i']}.png"))
+                                    img.save(os.path.join(intermediates_path, f"inter.{payload['i']}.png"))
 
                             samples: Tensor = sampling_fn(
                                 model_k_guidance,
