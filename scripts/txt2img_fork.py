@@ -61,7 +61,11 @@ class KSamplerCallbackPayload(TypedDict):
 KSamplerCallback: TypeAlias = Callable[[KSamplerCallbackPayload], None]
 
 class DiffusionModel(Protocol):
-    def __call__(x: Tensor, sigma: Tensor, **kwargs) -> Tensor: ...
+    def __call__(self, x: Tensor, sigma: Tensor, **kwargs) -> Tensor: ...
+    def differentiable_decode_first_stage(self, latents: Tensor) -> Tensor: ...
+    def decode_first_stage(self, latents: Tensor) -> Tensor: ...
+    def encode_first_stage(self, pixels: Tensor) -> Tensor: ...
+    def get_first_stage_encoding(self, encoded: Tensor) -> Tensor: ...
 
 class CondFn(Protocol):
     def __call__(x: Tensor, denoised: Tensor) -> Tensor: ...
@@ -69,17 +73,50 @@ class CondFn(Protocol):
 class CondFnFactory(Protocol):
     def __call__(target_embed: Tensor) -> CondFn: ...
 
-# def make_cond_fn() -> CondFn:
-#     pass 
+class DiffusionModelMixin(DiffusionModel):
+    inner_model: DiffusionModel
 
-def make_cond_model_fn(model: DiffusionModel, cond_fn_factory: CondFnFactory) -> DiffusionModel:
+    def differentiable_decode_first_stage(self, latents: Tensor) -> Tensor:
+        return self.inner_model.differentiable_decode_first_stage(latents)
+
+    def decode_first_stage(self, latents: Tensor) -> Tensor:
+        return self.inner_model.decode_first_stage(latents)
+
+    def encode_first_stage(self, pixels: Tensor) -> Tensor:
+        return self.inner_model.encode_first_stage(pixels)
+
+    def get_first_stage_encoding(self, encoded: Tensor) -> Tensor:
+        return self.inner_model.get_first_stage_encoding(encoded)
+
+class BaseModelWrapper(nn.Module, DiffusionModelMixin):
+    inner_model: DiffusionModel
+    def __init__(self, inner_model: DiffusionModel):
+        super().__init__()
+        self.inner_model = inner_model
+        DiffusionModelMixin.__init__(self)
+
+# workaround until k-diffusion introduces official base model wrapper,
+# to make the wrapper forward all method calls to the wrapped model
+# https://github.com/crowsonkb/k-diffusion/pull/23#issuecomment-1239937951
+class CompVisDenoiserWrapper(CompVisDenoiser, DiffusionModelMixin):
+    inner_model: DiffusionModel
+    def __init__(self, model: DiffusionModel, quantize=False):
+        CompVisDenoiser.__init__(self, model, quantize=quantize)
+        DiffusionModelMixin.__init__(self)
+
+class ClipGuidedDenoiser(BaseModelWrapper):
+    cond_fn_factory: CondFnFactory
+    def __init__(self, model: DiffusionModel, cond_fn_factory: CondFnFactory):
+        super().__init__(model)
+        self.cond_fn_factory = cond_fn_factory
+
     @enable_grad()
-    def model_fn(x: Tensor, sigma: Tensor, target_embed: Tensor, **kwargs) -> Tensor:
+    def forward(self, x: Tensor, sigma: Tensor, target_embed: Tensor, **kwargs) -> Tensor:
         x = x.detach().requires_grad_()
         print(stat(x)) # min: -61.731, max: 58.223, std: 14.773, [1, 4, 64, 64]
-        denoised: Tensor = model(x, sigma, **kwargs)
+        denoised: Tensor = self.inner_model(x, sigma, **kwargs)
         print(stat(denoised)) # min: -0.629, max: 1.099, std: 0.265, [1, 4, 64, 64]
-        cond_fn: CondFn = cond_fn_factory(target_embed)
+        cond_fn: CondFn = self.cond_fn_factory(target_embed)
         cond_grad: Tensor = cond_fn(x, denoised=denoised).detach()
         print(stat(cond_grad)) # min: -0.057, max: 0.038, std: 0.010, [1, 4, 64, 64]
         ndim = x.ndim
@@ -87,17 +124,20 @@ def make_cond_model_fn(model: DiffusionModel, cond_fn_factory: CondFnFactory) ->
         cond_denoised: Tensor = denoised.detach() + cond_grad * append_dims(sigma**2, ndim)
         print(stat(cond_denoised)) # min: -11.322, max: 7.676, std: 2.160, [1, 4, 64, 64]
         return cond_denoised
-    return model_fn
 
 def spherical_dist_loss(x: Tensor, y: Tensor) -> Tensor:
     x = F.normalize(x, dim=-1)
     y = F.normalize(y, dim=-1)
     return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
 
-def make_static_thresh_model_fn(model: DiffusionModel, value=1.) -> DiffusionModel:
-    def model_fn(x: Tensor, sigma: Tensor, **kwargs) -> Tensor:
-        return model(x, sigma, **kwargs).clamp(-value, value)
-    return model_fn
+class StaticThresholdingDenoiser(BaseModelWrapper):
+    threshold: float
+    def __init__(self, model: DiffusionModel, threshold=1.):
+        super().__init__(model)
+        self.threshold = threshold
+
+    def forward(self, x: Tensor, sigma: Tensor, **kwargs) -> Tensor:
+        return self.inner_model(x, sigma, **kwargs).clamp(-self.threshold, self.threshold)
 
 # samplers from the Karras et al paper
 PRE_KARRAS_K_DIFF_SAMPLERS = { 'k_lms', 'dpm2_ancestral', 'euler_ancestral' }
@@ -108,12 +148,7 @@ NOT_K_DIFF_SAMPLERS = { 'ddim', 'plms' }
 VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
 
 # lacks support for CFG (poorly named, right?)
-class KCFGDenoiser(nn.Module):
-    inner_model: DiffusionModel
-    def __init__(self, model: DiffusionModel):
-        super().__init__()
-        self.inner_model = model
-
+class KCFGDenoiser(BaseModelWrapper):
     def forward(
         self,
         x: FloatTensor,
@@ -838,7 +873,7 @@ def main():
     latents_to_pils: LatentsToPils = make_latents_to_pils(model)
 
     if opt.sampler in K_DIFF_SAMPLERS:
-        model_k_wrapped = CompVisDenoiser(model, quantize=True)
+        model_k_wrapped = CompVisDenoiserWrapper(model, quantize=True)
         model_k_guidance = KCFGDenoiser(model_k_wrapped)
     elif opt.sampler in NOT_K_DIFF_SAMPLERS:
         if opt.sampler == 'plms':
@@ -919,11 +954,12 @@ def main():
                 return grad
             return cond_fn
         
-        model_k_guidance = make_cond_model_fn(model_k_guidance, cond_fn_factory)
+        # model_k_guidance = make_cond_model_fn(model_k_guidance, cond_fn_factory)
+        model_k_guidance = ClipGuidedDenoiser(model_k_guidance, cond_fn_factory)
         # static thresholding on every step makes the bear look like cornflakes.
         # we don't need it at low scales (e.g. 100), because latents don't clip too badly (pun intended)
         # TODO: try dynamic thresholding (on every sampler step, not the silly one-shot approach I commented-out elsewhere)
-        # model_k_guidance = make_static_thresh_model_fn(model_k_guidance)
+        # model_k_guidance = StaticThresholdingDenoiser(model_k_guidance)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
