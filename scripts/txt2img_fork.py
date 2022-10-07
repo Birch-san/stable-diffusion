@@ -870,7 +870,7 @@ def main():
         
         model_k_guidance = make_cond_model_fn(model_k_guidance, cond_fn_factory)
         # static thresholding on every step makes the bear look like cornflakes.
-        # we don't need it at low scales (e.g. 100), because latents don't clip to badly (pun intended)
+        # we don't need it at low scales (e.g. 100), because latents don't clip too badly (pun intended)
         # TODO: try dynamic thresholding (on every sampler step, not the silly one-shot approach I commented-out elsewhere)
         # model_k_guidance = make_static_thresh_model_fn(model_k_guidance)
 
