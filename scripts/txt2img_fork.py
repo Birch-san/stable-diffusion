@@ -199,6 +199,35 @@ class DynamicThresholdingDenoiser(BaseModelWrapper):
         new_latents: Tensor = self.inner_model.get_first_stage_encoding(encoded)
         return new_latents
 
+class DynamicThresholdingBackpropDenoiser(BaseModelWrapper):
+    apply_threshold: TensorDecorator
+    def __init__(self, model: DiffusionModel, dynamic_thresholding_percentile: float):
+        super().__init__(model)
+        self.apply_threshold = partial(dynamic_threshold, dynamic_thresholding_percentile)
+
+    def forward(
+        self,
+        x: FloatTensor,
+        sigma: FloatTensor,
+        cond: FloatTensor,
+        **kwargs,
+    ) -> FloatTensor:
+        latents: FloatTensor = self.inner_model(x, sigma, cond=cond, **kwargs)
+        with enable_grad():
+            latents: FloatTensor = latents.detach().requires_grad_()
+            decoded: FloatTensor = self.inner_model.differentiable_decode_first_stage(latents)
+
+            thresholded: Tensor = self.apply_threshold(decoded)
+
+            # loss: Tensor = (decoded-pixels).abs()
+            losses: Tensor = torch.nn.functional.mse_loss(thresholded, decoded, reduction='none')
+            loss: Tensor = losses.mean([1, 2, 3])
+            grad = -torch.autograd.grad(loss, latents)[0]
+        grad = grad.detach()
+        new_latents = latents.detach() + grad * append_dims(sigma**2, latents.ndim)
+        
+        return new_latents
+
 # samplers from the Karras et al paper
 PRE_KARRAS_K_DIFF_SAMPLERS = { 'k_lms', 'dpm2_ancestral', 'euler_ancestral' }
 KARRAS_SAMPLERS = { 'heun', 'euler', 'dpm2' }
@@ -1014,7 +1043,8 @@ def main():
         # model_k_guidance = StaticThresholdingDenoiser(model_k_guidance)
     
     if opt.dynamic_thresholding:
-        model_k_guidance = DynamicThresholdingDenoiser(model_k_guidance, opt.dynamic_thresholding_percentile)
+        # model_k_guidance = DynamicThresholdingDenoiser(model_k_guidance, opt.dynamic_thresholding_percentile)
+        model_k_guidance = DynamicThresholdingBackpropDenoiser(model_k_guidance, opt.dynamic_thresholding_percentile)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
