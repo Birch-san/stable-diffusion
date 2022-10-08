@@ -159,12 +159,7 @@ class KCFGDenoiser(BaseModelWrapper):
         return self.inner_model(x, sigma, cond=cond)
 
 # lacks support for multi-cond
-class KCFGDenoiserSimple(nn.Module):
-    inner_model: DiffusionModel
-    def __init__(self, model: DiffusionModel):
-        super().__init__()
-        self.inner_model = model
-
+class KCFGDenoiserSimple(BaseModelWrapper):
     def forward(
         self,
         x: FloatTensor,
@@ -186,12 +181,7 @@ class KCFGDenoiserSimple(nn.Module):
         del x_in, sigma_in, cond_in
         return uncond + (cond - uncond) * cond_scale
 
-class KCFGDenoiserOrig(nn.Module):
-    inner_model: DiffusionModel
-    def __init__(self, model: DiffusionModel):
-        super().__init__()
-        self.inner_model = model
-
+class KCFGDenoiserOrig(BaseModelWrapper):
     def forward(
         self,
         x: Tensor,
