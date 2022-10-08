@@ -176,6 +176,7 @@ def dynamic_threshold(percentile: float, t: Tensor) -> Tensor:
     pixels = pixels.clamp(neg_s, s)
     pixels = pixels.to(device) if clamp_tensors_on_cpu else pixels
     pixels = pixels / s_orig
+    return pixels
 
 class DynamicThresholdingDenoiser(BaseModelWrapper):
     apply_threshold: TensorDecorator
