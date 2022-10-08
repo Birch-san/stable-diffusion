@@ -940,6 +940,7 @@ def main():
                                 case 'k_lms' | _:
                                     sampling_fn = sample_lms
 
+                            sigmas = None
                             sigmas_quantized = None
                             noise_schedule_sampler_args = {}
                             if opt.karras_noise or opt.sampler in DPM_SOLVER_SAMPLERS:
@@ -987,6 +988,8 @@ def main():
                             if opt.sampler in DPM_SOLVER_SAMPLERS:
                                 noise_schedule_sampler_args['sigma_min'] = sigma_min
                                 noise_schedule_sampler_args['sigma_max'] = sigma_max
+                                if opt.sampler == 'dpm_fast':
+                                    noise_schedule_sampler_args['n'] = opt.steps
                             else:
                                 noise_schedule_sampler_args['sigmas'] = sigmas
                                 print('sigmas (before quantization):')
