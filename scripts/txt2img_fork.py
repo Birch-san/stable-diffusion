@@ -206,8 +206,7 @@ K_DIFF_SAMPLERS = { *KARRAS_SAMPLERS, *PRE_KARRAS_K_DIFF_SAMPLERS, *DPM_SOLVER_S
 NOT_K_DIFF_SAMPLERS = { 'ddim', 'plms' }
 VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
 
-# lacks support for CFG (poorly named, right?)
-class KCFGDenoiser(BaseModelWrapper):
+class NonCFGDenoiser(BaseModelWrapper):
     def forward(
         self,
         x: FloatTensor,
@@ -218,7 +217,7 @@ class KCFGDenoiser(BaseModelWrapper):
         return self.inner_model(x, sigma, cond=cond)
 
 # lacks support for multi-cond
-class KCFGDenoiserSimple(BaseModelWrapper):
+class CFGDenoiser(BaseModelWrapper):
     def forward(
         self,
         x: FloatTensor,
@@ -240,7 +239,7 @@ class KCFGDenoiserSimple(BaseModelWrapper):
         del x_in, sigma_in, cond_in
         return uncond + (cond - uncond) * cond_scale
 
-class KCFGDenoiserOrig(BaseModelWrapper):
+class MultiCondCFGDenoiser(BaseModelWrapper):
     def forward(
         self,
         x: Tensor,
@@ -921,7 +920,12 @@ def main():
 
     if opt.sampler in K_DIFF_SAMPLERS:
         model_k_wrapped = CompVisDenoiserWrapper(model, quantize=True)
-        model_k_guidance = KCFGDenoiser(model_k_wrapped)
+        # switching between denoisers of varying complexity depending on what technique I'm exploring
+        # until I unify these again: pick from one of
+        # NonCFGDenoiser
+        # CFGDenoiser
+        # MultiCondCFGDenoiser
+        model_k_guidance = CFGDenoiser(model_k_wrapped)
     elif opt.sampler in NOT_K_DIFF_SAMPLERS:
         if opt.sampler == 'plms':
             sampler = PLMSSampler(model)
