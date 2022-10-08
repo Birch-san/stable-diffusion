@@ -139,6 +139,53 @@ class StaticThresholdingDenoiser(BaseModelWrapper):
     def forward(self, x: Tensor, sigma: Tensor, **kwargs) -> Tensor:
         return self.inner_model(x, sigma, **kwargs).clamp(-self.threshold, self.threshold)
 
+class DynamicThresholdingDenoiser(BaseModelWrapper):
+    dynamic_thresholding_percentile: float
+    def __init__(self, model: DiffusionModel, dynamic_thresholding_percentile: float):
+        super().__init__(model)
+        self.dynamic_thresholding_percentile = dynamic_thresholding_percentile
+
+    def forward(
+        self,
+        x: FloatTensor,
+        sigma: FloatTensor,
+        cond: FloatTensor,
+        **kwargs,
+    ) -> FloatTensor:
+        device = x.device
+        latents: FloatTensor = self.inner_model(x, sigma, cond=cond, **kwargs)
+        decoded: FloatTensor = self.inner_model.decode_first_stage(latents)
+        # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
+        # adapted from lucidrains' imagen_pytorch (MIT-licensed)
+        flattened = rearrange(decoded, 'b c ... -> b c (...)').abs()
+        # aten::sort.values_stable not implemented for MPS
+        sort_on_cpu = device.type == 'mps'
+        flattened = flattened.cpu() if sort_on_cpu else flattened
+        # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
+        s = torch.quantile(
+            flattened,
+            self.dynamic_thresholding_percentile,
+            dim = 2
+        )
+        s = s.to(device) if sort_on_cpu else s
+        s.clamp_(min = 1.)
+        s = right_pad_dims_to(decoded, s)
+        # MPS complains min and input tensors must be of the same shape
+
+        clamp_tensors_on_cpu = device.type == 'mps'
+        s_orig = s
+        neg_s = -s
+        s = s.cpu() if clamp_tensors_on_cpu else s
+        neg_s = neg_s.cpu() if clamp_tensors_on_cpu else neg_s
+        pixels = decoded.cpu() if clamp_tensors_on_cpu else decoded
+        pixels = pixels.clamp(neg_s, s)
+        pixels = pixels.to(device) if clamp_tensors_on_cpu else pixels
+        pixels = pixels / s_orig
+
+        encoded = self.inner_model.encode_first_stage(pixels)
+        new_latents = self.inner_model.get_first_stage_encoding(encoded)
+        return new_latents
+
 # samplers from the Karras et al paper
 PRE_KARRAS_K_DIFF_SAMPLERS = { 'k_lms', 'dpm2_ancestral', 'euler_ancestral' }
 KARRAS_SAMPLERS = { 'heun', 'euler', 'dpm2' }
@@ -950,6 +997,9 @@ def main():
         # we don't need it at low scales (e.g. 100), because latents don't clip too badly (pun intended)
         # TODO: try dynamic thresholding (on every sampler step, not the silly one-shot approach I commented-out elsewhere)
         # model_k_guidance = StaticThresholdingDenoiser(model_k_guidance)
+    
+    if opt.dynamic_thresholding:
+        model_k_guidance = DynamicThresholdingDenoiser(model_k_guidance, opt.dynamic_thresholding_percentile)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
