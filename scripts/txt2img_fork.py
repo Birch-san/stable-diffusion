@@ -28,7 +28,7 @@ from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 
-from k_diffusion.sampling import sample_lms, sample_dpm_2, sample_dpm_2_ancestral, sample_euler, sample_euler_ancestral, sample_heun, get_sigmas_karras, append_zero
+from k_diffusion.sampling import sample_lms, sample_dpm_2, sample_dpm_2_ancestral, sample_euler, sample_euler_ancestral, sample_heun, sample_dpm_fast, sample_dpm_adaptive, get_sigmas_karras, append_zero
 from k_diffusion.external import CompVisDenoiser
 
 def get_device():
@@ -40,9 +40,10 @@ def get_device():
         return 'cpu'
 
 # samplers from the Karras et al paper
+PRE_KARRAS_K_DIFF_SAMPLERS = { 'k_lms', 'dpm2_ancestral', 'euler_ancestral' }
 KARRAS_SAMPLERS = { 'heun', 'euler', 'dpm2' }
-NON_KARRAS_K_DIFF_SAMPLERS = { 'k_lms', 'dpm2_ancestral', 'euler_ancestral' }
-K_DIFF_SAMPLERS = { *KARRAS_SAMPLERS, *NON_KARRAS_K_DIFF_SAMPLERS }
+DPM_SOLVER_SAMPLERS = { 'dpm_fast', 'dpm_adaptive' }
+K_DIFF_SAMPLERS = { *KARRAS_SAMPLERS, *PRE_KARRAS_K_DIFF_SAMPLERS, *DPM_SOLVER_SAMPLERS }
 NOT_K_DIFF_SAMPLERS = { 'ddim', 'plms' }
 VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
 
@@ -339,6 +340,23 @@ def load_img(path):
     image = torch.from_numpy(image)
     return 2.*image - 1.
 
+# the idea of "ending the noise ramp early" (i.e. setting a high sigma_min) is that sigmas as lower as sigma_min
+# aren't very impactful, and every sigma counts when our step count is low
+# https://github.com/crowsonkb/k-diffusion/pull/23#issuecomment-1234872495
+# this is just a more performant way to get the "sigma before sigma_min" from a noise schedule, aka
+# get_sigmas_karras(n=steps, sigma_max=sigma_max, sigma_min=sigma_min_nominal, rho=rho)[-3]
+def get_premature_sigma_min(
+    steps: int,
+    sigma_max: float,
+    sigma_min_nominal: float,
+    rho: float
+) -> float:
+    min_inv_rho = sigma_min_nominal ** (1 / rho)
+    max_inv_rho = sigma_max ** (1 / rho)
+    ramp = (steps-2) * 1/(steps-1)
+    sigma_min = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+    return sigma_min
+
 @dataclass
 class WeightedPrompt():
     text: str
@@ -443,14 +461,14 @@ def main():
     )
     # my recommendations for each sampler are:
     # implement samplers from Karras et al paper using Karras noise schedule
-    # if your step count is low (for example 7 or 8) you should use add --end_karras_ramp_early too.
-    # --heun --karras_noise
-    # --euler --karras_noise
-    # --dpm2 --karras_noise
+    # if your step count is low (for example 7 or 8) you should use add --end_noise_ramp_early too.
+    # --sampler heun --karras_noise
+    # --sampler euler --karras_noise
+    # --sampler dpm2 --karras_noise
     # I assume Karras noise schedule is generally applicable, so is suitable for use with any k-diffusion sampler.
-    # --k_lms --karras_noise
-    # --euler_ancestral --karras_noise
-    # --dpm2_ancestral --karras_noise
+    # --sampler k_lms --karras_noise
+    # --sampler euler_ancestral --karras_noise
+    # --sampler dpm2_ancestral --karras_noise
     # I didn't implement any way to generate the DDIM/PLMS sigmas from a Karras noise schedule
     # --ddim
     # --plms
@@ -460,15 +478,35 @@ def main():
         help=f"use noise schedule from arXiv:2206.00364. Implemented for k-diffusion samplers, {K_DIFF_SAMPLERS}. but you should probably use it with one of the samplers introduced in the same paper: {KARRAS_SAMPLERS}.",
     )
     parser.add_argument(
-        "--end_karras_ramp_early",
+        "--end_noise_ramp_early",
         action='store_true',
-        help=f"when --karras_noise is enabled: ramp from sigma_max (14.6146) to a sigma *slightly above* sigma_min (0.0292), instead of including sigma_min in our ramp. because the effect on the image of sampling sigma_min is not very big, and every sigma counts when our step counts are low. use this to get good results with {KARRAS_SAMPLERS} at step counts as low as 7 or 8.",
+        help=f"when --karras_noise is enabled: ramp from sigma_max (14.6146) to a sigma *slightly above* sigma_min (0.0292), instead of including sigma_min in our ramp. because the effect on the image of sampling the model's true sigma_min is not very big, and every sigma counts when our step counts are low. use this to get good results with {KARRAS_SAMPLERS} at step counts as low as 7 or 8. at step count 7, this is equivalent to --sigma_min 0.1072. at step count 8, this is equivalent to --sigma_min 0.0936.",
+    )
+    parser.add_argument(
+        "--sigma_max",
+        type=float,
+        nargs="?",
+        default=None,
+        help=f"when using --karras_noise, `--sampler dpm_fast` or `--sampler dpm_adaptive`: overrides default sigma_max (14.6146, the highest on which the model was trained). set this lower if you're using low step counts, and want to focus on middle or low sigmas (to prioritize face or hair details, at the expense of pose and body shape). see also --rho for how to control how the schedule curves in the middle.",
+    )
+    parser.add_argument(
+        "--sigma_min",
+        type=float,
+        nargs="?",
+        default=None,
+        help=f"when using --karras_noise, `--sampler dpm_fast` or `--sampler dpm_adaptive`: overrides default sigma_min (0.0292, the lowest on which the model was trained). set this higher if you're using low step counts, and want to focus on middle or high sigmas (to prioritize pose or body shape, at the expense of face and hair details). see also --rho for how to control how the schedule curves in the middle. takes precedence over --end_noise_ramp_early.",
     )
     parser.add_argument(
         "--rho",
         type=float,
         default=7.,
         help=f"when --karras_noise is enabled: skew towards sampling from higher or lower sigmas. rho=10 samples more from low sigmas (<1.0); good for making faces coherent. rho=5 spends more time on high sigmas (>2.0); good for pose and body shape.",
+    )
+    parser.add_argument(
+        "--churn",
+        type=float,
+        default=0.,
+        help=f"when using a Karras sampler ({KARRAS_SAMPLERS}): introduce noise on every sampling step. This gives the same 'creative' effect for which euler ancestral is famous. Currently lacks support for sigma_hat discretization (see https://github.com/crowsonkb/k-diffusion/pull/23).",
     )
     parser.add_argument(
         "--dynamic_thresholding",
@@ -885,6 +923,10 @@ def main():
                                 )
                         elif opt.sampler in K_DIFF_SAMPLERS:
                             match opt.sampler:
+                                case 'dpm_fast':
+                                    sampling_fn = sample_dpm_fast
+                                case 'dpm_adaptive':
+                                    sampling_fn = sample_dpm_adaptive
                                 case 'dpm2':
                                     sampling_fn = sample_dpm_2
                                 case 'dpm2_ancestral':
@@ -898,66 +940,63 @@ def main():
                                 case 'k_lms' | _:
                                     sampling_fn = sample_lms
 
+                            sigmas_quantized = None
                             noise_schedule_sampler_args = {}
-                            # Karras sampling schedule achieves higher FID in fewer steps
-                            # https://arxiv.org/abs/2206.00364
-                            if opt.karras_noise:
-                                if opt.sampler not in KARRAS_SAMPLERS:
-                                    print(f"[WARN] you have enabled --karras_noise, but you are using it with a sampler ({opt.sampler}) outside of the ones proposed in the same paper (arXiv:2206.00364), {KARRAS_SAMPLERS}. No idea what results you'll get.")
-                                
-                                # the idea of "ending the Karras ramp early" (i.e. setting a high sigma_min) is that sigmas as lower as sigma_min
-                                # aren't very impactful, and every sigma counts when our step count is low
-                                # https://github.com/crowsonkb/k-diffusion/pull/23#issuecomment-1234872495
-                                # this is just a more performant way to get the "sigma before sigma_min" from a Karras schedule, aka
-                                # get_sigmas_karras(n=steps, sigma_max=sigma_max, sigma_min=sigma_min_nominal, rho=rho)[-3]
-                                def get_premature_sigma_min(
-                                    steps: int,
-                                    sigma_max: float,
-                                    sigma_min_nominal: float,
-                                    rho: float
-                                ) -> float:
-                                    min_inv_rho = sigma_min_nominal ** (1 / rho)
-                                    max_inv_rho = sigma_max ** (1 / rho)
-                                    ramp = (steps-2) * 1/(steps-1)
-                                    sigma_min = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
-                                    return sigma_min
-
-                                # 14.6146
-                                sigma_max=model_k_wrapped.sigmas[-1].item()
+                            if opt.karras_noise or opt.sampler in DPM_SOLVER_SAMPLERS:
                                 # 0.0292
-                                sigma_min_nominal=model_k_wrapped.sigmas[0].item()
-                                # get the "sigma before sigma_min" from a slightly longer ramp
-                                # https://github.com/crowsonkb/k-diffusion/pull/23#issuecomment-1234872495
-                                premature_sigma_min = get_premature_sigma_min(
-                                    steps=opt.steps+1,
-                                    sigma_max=sigma_max,
-                                    sigma_min_nominal=sigma_min_nominal,
-                                    rho=opt.rho
-                                )
-                                sigmas = get_sigmas_karras(
-                                    n=opt.steps,
-                                    sigma_min=premature_sigma_min if opt.end_karras_ramp_early else sigma_min_nominal,
-                                    sigma_max=sigma_max,
-                                    rho=opt.rho,
-                                    device=device,
-                                )
-                                karras_noise_active = True
-                                end_karras_ramp_early_active = opt.end_karras_ramp_early
+                                sigma_min = opt.sigma_min or model_k_wrapped.sigma_min.item()
+                                # 14.6146
+                                sigma_max = opt.sigma_max or model_k_wrapped.sigma_max.item()
+                                if opt.end_noise_ramp_early and not opt.sigma_min:
+                                    # get the "sigma before sigma_min" from a slightly longer ramp
+                                    # https://github.com/crowsonkb/k-diffusion/pull/23#issuecomment-1234872495
+                                    sigma_min = get_premature_sigma_min(
+                                        steps=opt.steps+1,
+                                        sigma_max=sigma_max,
+                                        sigma_min_nominal=model_k_wrapped.sigma_min.item(),
+                                        rho=opt.rho
+                                    )
+                                
+                                # Karras sampling schedule achieves higher FID in fewer steps
+                                # https://arxiv.org/abs/2206.00364
+                                if opt.sampler not in DPM_SOLVER_SAMPLERS:
+                                    if opt.sampler not in KARRAS_SAMPLERS:
+                                        print(f"[WARN] you have enabled --karras_noise, but you are using it with a sampler ({opt.sampler}) outside of the ones proposed in the same paper (arXiv:2206.00364), {KARRAS_SAMPLERS}. No idea what results you'll get.")
+
+                                    sigmas = get_sigmas_karras(
+                                        n=opt.steps,
+                                        sigma_min=sigma_min,
+                                        sigma_max=sigma_max,
+                                        rho=opt.rho,
+                                        device=device,
+                                    )
+                                    karras_noise_active = True
+                                    end_karras_ramp_early_active = opt.end_noise_ramp_early
                             else:
                                 if opt.sampler in KARRAS_SAMPLERS:
                                     print(f"[WARN] you should really enable --karras_noise for best results; it's the noise schedule proposed in the same paper (arXiv:2206.00364) as the sampler you're using ({opt.sampler}). Falling back to default k-diffusion get_sigmas() noise schedule.")
                                 sigmas = model_k_wrapped.get_sigmas(opt.steps)
+
+                            if opt.sampler in KARRAS_SAMPLERS:
+                                noise_schedule_sampler_args['s_churn'] = opt.churn
                             
                             if init_latent is not None:
+                                assert opt.sampler not in DPM_SOLVER_SAMPLERS, "img2img not yet implemented for DPM-Solver samplers -- need to figure out how to skip a portion of the noise schedule"
                                 sigmas = sigmas[len(sigmas) - t_enc - 1 :]
                             
-                            print('sigmas (before quantization):')
-                            print(format_sigmas_pretty(sigmas))
-                            print('sigmas (after quantization):')
-                            sigmas_quantized = append_zero(model_k_wrapped.sigmas[torch.argmin((sigmas[:-1].reshape(len(sigmas)-1, 1).repeat(1, len(model_k_wrapped.sigmas)) - model_k_wrapped.sigmas).abs(), dim=1)])
-                            print(format_sigmas_pretty(sigmas_quantized))
+                            if opt.sampler in DPM_SOLVER_SAMPLERS:
+                                noise_schedule_sampler_args['sigma_min'] = sigma_min
+                                noise_schedule_sampler_args['sigma_max'] = sigma_max
+                            else:
+                                noise_schedule_sampler_args['sigmas'] = sigmas
+                                print('sigmas (before quantization):')
+                                print(format_sigmas_pretty(sigmas))
+                                print('sigmas (after quantization):')
+                                sigmas_quantized = append_zero(model_k_wrapped.sigmas[torch.argmin((sigmas[:-1].reshape(len(sigmas)-1, 1).repeat(1, len(model_k_wrapped.sigmas)) - model_k_wrapped.sigmas).abs(), dim=1)])
+                                print(format_sigmas_pretty(sigmas_quantized))
 
-                            x = start_code * sigmas[0] # for GPU draw
+                            first_sigma = sigma_max if opt.sampler in DPM_SOLVER_SAMPLERS else sigmas[0]
+                            x = start_code * first_sigma
                             if init_latent is not None:
                                 x = init_latent + x
                             extra_args = {
@@ -970,7 +1009,6 @@ def main():
                             samples = sampling_fn(
                                 model_k_guidance,
                                 x,
-                                sigmas,
                                 extra_args=extra_args,
                                 **noise_schedule_sampler_args)
 
