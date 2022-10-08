@@ -1,4 +1,5 @@
 import argparse, os, sys, glob, fnmatch
+from functools import partial
 import cv2
 from cv2 import randn
 import torch
@@ -58,6 +59,9 @@ class KSamplerCallbackPayload(TypedDict):
     sigma_hat: FloatTensor
     denoised: FloatTensor
 
+T = TypeVar('T')
+Decorator: TypeAlias = Callable[[T], T]
+TensorDecorator: TypeAlias = Decorator[Tensor]
 KSamplerCallback: TypeAlias = Callable[[KSamplerCallbackPayload], None]
 
 class DiffusionModel(Protocol):
@@ -139,11 +143,45 @@ class StaticThresholdingDenoiser(BaseModelWrapper):
     def forward(self, x: Tensor, sigma: Tensor, **kwargs) -> Tensor:
         return self.inner_model(x, sigma, **kwargs).clamp(-self.threshold, self.threshold)
 
+def dynamic_threshold(percentile: float, t: Tensor) -> Tensor:
+    r"""
+    Args:
+        percentile: float between 0.0 and 1.0. for example 0.995 would subject only the top 0.5%ile to clamping.
+        t: [b, c, h, w] tensor in pixel or latent space.
+    """
+    device = t.device
+    # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
+    # adapted from lucidrains' imagen_pytorch (MIT-licensed)
+    flattened = rearrange(t, 'b c ... -> b c (...)').abs()
+    # aten::sort.values_stable not implemented for MPS
+    sort_on_cpu = device.type == 'mps'
+    flattened = flattened.cpu() if sort_on_cpu else flattened
+    # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
+    s = torch.quantile(
+        flattened,
+        percentile,
+        dim = 2
+    )
+    s = s.to(device) if sort_on_cpu else s
+    s.clamp_(min = 1.)
+    s = right_pad_dims_to(t, s)
+    # MPS complains min and input tensors must be of the same shape
+
+    clamp_tensors_on_cpu = device.type == 'mps'
+    s_orig = s
+    neg_s = -s
+    s = s.cpu() if clamp_tensors_on_cpu else s
+    neg_s = neg_s.cpu() if clamp_tensors_on_cpu else neg_s
+    pixels = t.cpu() if clamp_tensors_on_cpu else t
+    pixels = pixels.clamp(neg_s, s)
+    pixels = pixels.to(device) if clamp_tensors_on_cpu else pixels
+    pixels = pixels / s_orig
+
 class DynamicThresholdingDenoiser(BaseModelWrapper):
-    dynamic_thresholding_percentile: float
+    apply_threshold: TensorDecorator
     def __init__(self, model: DiffusionModel, dynamic_thresholding_percentile: float):
         super().__init__(model)
-        self.dynamic_thresholding_percentile = dynamic_thresholding_percentile
+        self.apply_threshold = partial(dynamic_threshold, dynamic_thresholding_percentile)
 
     def forward(
         self,
@@ -152,38 +190,12 @@ class DynamicThresholdingDenoiser(BaseModelWrapper):
         cond: FloatTensor,
         **kwargs,
     ) -> FloatTensor:
-        device = x.device
         latents: FloatTensor = self.inner_model(x, sigma, cond=cond, **kwargs)
         decoded: FloatTensor = self.inner_model.decode_first_stage(latents)
-        # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
-        # adapted from lucidrains' imagen_pytorch (MIT-licensed)
-        flattened = rearrange(decoded, 'b c ... -> b c (...)').abs()
-        # aten::sort.values_stable not implemented for MPS
-        sort_on_cpu = device.type == 'mps'
-        flattened = flattened.cpu() if sort_on_cpu else flattened
-        # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
-        s = torch.quantile(
-            flattened,
-            self.dynamic_thresholding_percentile,
-            dim = 2
-        )
-        s = s.to(device) if sort_on_cpu else s
-        s.clamp_(min = 1.)
-        s = right_pad_dims_to(decoded, s)
-        # MPS complains min and input tensors must be of the same shape
+        pixels: Tensor = self.apply_threshold(decoded)
 
-        clamp_tensors_on_cpu = device.type == 'mps'
-        s_orig = s
-        neg_s = -s
-        s = s.cpu() if clamp_tensors_on_cpu else s
-        neg_s = neg_s.cpu() if clamp_tensors_on_cpu else neg_s
-        pixels = decoded.cpu() if clamp_tensors_on_cpu else decoded
-        pixels = pixels.clamp(neg_s, s)
-        pixels = pixels.to(device) if clamp_tensors_on_cpu else pixels
-        pixels = pixels / s_orig
-
-        encoded = self.inner_model.encode_first_stage(pixels)
-        new_latents = self.inner_model.get_first_stage_encoding(encoded)
+        encoded: Tensor = self.inner_model.encode_first_stage(pixels)
+        new_latents: Tensor = self.inner_model.get_first_stage_encoding(encoded)
         return new_latents
 
 # samplers from the Karras et al paper
@@ -277,8 +289,6 @@ class KCFGDenoiserOrig(BaseModelWrapper):
 def chunk(it, size):
     it = iter(it)
     return iter(lambda: tuple(islice(it, size)), ())
-
-T = TypeVar('T')
 
 @dataclass
 class InBetweenParams(Generic[T]):
