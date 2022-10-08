@@ -105,6 +105,8 @@
         "--dynamic_thresholding",
         "--dynamic_thresholding_percentile",
         "0.995",
+        "--dynamic_thresholding_loss_scale",
+        "30",
         // "--fixed_code",
         // "--init_img",
         // "/Users/birch/dall-e-mega/fumo plush of lina from dota 1.jpg",

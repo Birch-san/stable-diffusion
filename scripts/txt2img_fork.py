@@ -201,9 +201,16 @@ class DynamicThresholdingDenoiser(BaseModelWrapper):
 
 class DynamicThresholdingBackpropDenoiser(BaseModelWrapper):
     apply_threshold: TensorDecorator
-    def __init__(self, model: DiffusionModel, dynamic_thresholding_percentile: float):
+    loss_scale: float
+    def __init__(
+        self,
+        model: DiffusionModel,
+        thresholding_percentile: float,
+        loss_scale: float
+    ):
         super().__init__(model)
-        self.apply_threshold = partial(dynamic_threshold, dynamic_thresholding_percentile)
+        self.apply_threshold = partial(dynamic_threshold, thresholding_percentile)
+        self.loss_scale = loss_scale
 
     def forward(
         self,
@@ -219,9 +226,8 @@ class DynamicThresholdingBackpropDenoiser(BaseModelWrapper):
 
             thresholded: Tensor = self.apply_threshold(decoded)
 
-            # loss: Tensor = (decoded-pixels).abs()
             losses: Tensor = torch.nn.functional.mse_loss(thresholded, decoded, reduction='none')
-            loss: Tensor = losses.mean([1, 2, 3])
+            loss: Tensor = losses.mean([1, 2, 3]) * self.loss_scale
             grad = -torch.autograd.grad(loss, latents)[0]
         grad = grad.detach()
         new_latents = latents.detach() + grad * append_dims(sigma**2, latents.ndim)
@@ -776,6 +782,12 @@ def main():
         default=0.9995,
     )
     parser.add_argument(
+        "--dynamic_thresholding_loss_scale",
+        type=float,
+        default=30,
+        help="when backpropagating into latents the loss between unthresholded and thresholded pixels: factor by which to amplify the loss",
+    )
+    parser.add_argument(
         "--laion400m",
         action='store_true',
         help="uses the LAION400M model",
@@ -1044,7 +1056,7 @@ def main():
     
     if opt.dynamic_thresholding:
         # model_k_guidance = DynamicThresholdingDenoiser(model_k_guidance, opt.dynamic_thresholding_percentile)
-        model_k_guidance = DynamicThresholdingBackpropDenoiser(model_k_guidance, opt.dynamic_thresholding_percentile)
+        model_k_guidance = DynamicThresholdingBackpropDenoiser(model_k_guidance, opt.dynamic_thresholding_percentile, opt.dynamic_thresholding_loss_scale)
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
