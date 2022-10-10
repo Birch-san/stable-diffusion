@@ -212,7 +212,7 @@ class PersonalizedBase(Dataset):
                 return subject
             labels = sample(even_more_labels, label_count)
             joined = ', '.join(labels)
-            return f"photo of {character} {placeholder_string}, {joined}"
+            return f"{subject} with {joined}"
 
         match stem:
             case 'koishi':
