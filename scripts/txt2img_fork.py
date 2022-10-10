@@ -1,9 +1,9 @@
-import argparse, os, sys, glob
+import argparse, os, sys, glob, fnmatch
 import cv2
 from cv2 import randn
 import torch
 import numpy as np
-from torch import Tensor, FloatTensor
+from torch import Tensor, FloatTensor, uint8
 from omegaconf import OmegaConf
 from PIL import Image
 from PIL.Image import Resampling
@@ -17,7 +17,7 @@ from pytorch_lightning import seed_everything
 from torch import autocast, nn
 from contextlib import contextmanager, nullcontext
 from random import randint
-from typing import Generic, Optional, Iterable, List, TypeAlias, Tuple, TypeVar, Callable
+from typing import Generic, Optional, Iterable, List, TypeAlias, Tuple, TypeVar, Callable, Protocol, TypedDict
 import re
 from ldm.models.diffusion.ddpm import LatentDiffusion
 import abc
@@ -38,6 +38,15 @@ def get_device():
         return 'mps'
     else:
         return 'cpu'
+
+class KSamplerCallbackPayload(TypedDict):
+    x: FloatTensor
+    i: int
+    sigma: FloatTensor
+    sigma_hat: FloatTensor
+    denoised: FloatTensor
+
+KSamplerCallback: TypeAlias = Callable[[KSamplerCallbackPayload], None]
 
 # samplers from the Karras et al paper
 PRE_KARRAS_K_DIFF_SAMPLERS = { 'k_lms', 'dpm2_ancestral', 'euler_ancestral' }
@@ -154,6 +163,25 @@ def numpy_to_pil(images):
     pil_images = [Image.fromarray(image) for image in images]
 
     return pil_images
+
+class LatentsToPils(Protocol):
+    def __call__(x: Tensor) -> Tensor: List[Image.Image]
+
+def make_latents_to_pils(model: LatentDiffusion) -> LatentsToPils:
+    def latents_to_pils(latents: Tensor) -> List[Image.Image]:
+        decoded: Tensor = model.decode_first_stage(latents)
+        clamped: Tensor = torch.clamp((decoded + 1.0) / 2.0, min=0.0, max=1.0)
+        del decoded
+        rearranged: Tensor = rearrange(clamped, 'b c h w -> b h w c')
+        del clamped
+        denormalized: Tensor = 255. * rearranged
+        del rearranged
+        rgb_images = denormalized.cpu().to(dtype=uint8).numpy()
+        del denormalized
+        pils: List[Image.Image] = [Image.fromarray(rgb_image) for rgb_image in rgb_images]
+        del rgb_images
+        return pils
+    return latents_to_pils
 
 def repeat_along_dim_0(t: Tensor, factor: int) -> Tensor:
     """
@@ -648,6 +676,11 @@ def main():
         help="include sigmas in file name",
     )
     parser.add_argument(
+        "--log_intermediates",
+        action='store_true',
+        help="print denoised latent predictions from each k-diffusion sampler step",
+    )
+    parser.add_argument(
         "--init_img",
         type=str,
         nargs="?",
@@ -681,6 +714,8 @@ def main():
 
     device = torch.device(get_device())
     model = model.to(device)
+
+    latents_to_pils: LatentsToPils = make_latents_to_pils(model)
 
     if opt.sampler in K_DIFF_SAMPLERS:
         model_k_wrapped = CompVisDenoiser(model, quantize=True)
@@ -755,9 +790,11 @@ def main():
         ]
 
     sample_path = os.path.join(outpath, "samples")
+    intermediates_path = os.path.join(outpath, "intermediates")
     os.makedirs(sample_path, exist_ok=True)
-    base_count = len(os.listdir(sample_path))
-    grid_count = len(os.listdir(outpath)) - 1
+    os.makedirs(intermediates_path, exist_ok=True)
+    base_count = len(fnmatch.filter(os.listdir(sample_path), f"{5*'[0-9]'}.*.png"))
+    grid_count = len(fnmatch.filter(os.listdir(outpath), f"grid-{4*'[0-9]'}.*.png"))
 
     shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
 
@@ -1009,10 +1046,17 @@ def main():
                                 'cond_arities': cond_arities,
                                 'cond_scale': opt.scale,
                             }
-                            samples = sampling_fn(
+
+                            def log_intermediate(payload: KSamplerCallbackPayload) -> None:
+                                sample_pils: List[Image.Image] = latents_to_pils(payload['denoised'])
+                                for img in sample_pils:
+                                    img.save(os.path.join(intermediates_path, f"inter.{payload['i']}.png"))
+
+                            samples: Tensor = sampling_fn(
                                 model_k_guidance,
                                 x,
                                 extra_args=extra_args,
+                                callback=log_intermediate if opt.log_intermediates else None,
                                 **noise_schedule_sampler_args)
 
                         x_samples = model.decode_first_stage(samples)

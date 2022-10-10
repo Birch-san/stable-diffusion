@@ -86,6 +86,7 @@
         // "--sampler", "plms",
         "--steps", "8",
         "--sampler", "heun",
+        // "--log_intermediates",
         // "--sampler", "dpm_adaptive",
         // "--rho", "5.75",
         "--karras_noise",
