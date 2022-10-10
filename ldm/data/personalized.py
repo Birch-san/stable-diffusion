@@ -117,7 +117,7 @@ class PersonalizedBase(Dataset):
         per_image_tokens=False,
         center_crop=False,
         mixing_prob=0.25,
-        coarse_class_text=None,
+        coarse_class_text='plush',
     ):
 
         self.data_root = data_root
