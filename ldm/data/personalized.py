@@ -6,6 +6,8 @@ from PIL.Image import Resampling
 from torch.utils.data import Dataset
 from torchvision import transforms
 from pathlib import Path
+from typing import List
+from random import sample, randrange, random
 
 # import random
 
@@ -170,8 +172,11 @@ class PersonalizedBase(Dataset):
 
         placeholder_string = self.placeholder_token
         if self.coarse_class_text:
+            # placeholder_string = (
+            #     f'{self.coarse_class_text} {placeholder_string}'
+            # )
             placeholder_string = (
-                f'{self.coarse_class_text} {placeholder_string}'
+                f'{placeholder_string} {self.coarse_class_text}'
             )
 
         # if self.per_image_tokens and np.random.uniform() < self.mixing_prob:
@@ -183,20 +188,59 @@ class PersonalizedBase(Dataset):
         #         placeholder_string
         #     )
 
-        # text = template_fumo.format(placeholder_string)
+        def describe_placeholder() -> str:
+            if random() < 0.3:
+                return self.placeholder_token
+            return placeholder_string
+
+
+        def describe_subject(character: str) -> str:
+            placeholder: str = describe_placeholder()
+            if random() < 0.3:
+                return f"photo of {placeholder}"
+            return f"photo of {character} {placeholder}"
+
+        def make_prompt(character: str, general_labels: List[str], sitting=True, on_floor=True) -> str:
+            even_more_labels = [*general_labels, 'one girl']
+            if sitting:
+                even_more_labels.append('sitting')
+            if on_floor:
+                even_more_labels.append('on floor')
+            subject: str = describe_subject(character)
+            label_count = randrange(0, len(even_more_labels))
+            if label_count == 0:
+                return subject
+            labels = sample(even_more_labels, label_count)
+            joined = ', '.join(labels)
+            return f"photo of {character} {placeholder_string}, {joined}"
+
         match stem:
+            case 'koishi':
+                text = make_prompt('komeiji koishi', ['green hair', 'black footwear', 'medium hair', 'blue eyes', 'yellow jacket', 'green skirt' 'hat', 'black headwear', 'smile', 'touhou project'])
+            case 'flandre':
+                text = make_prompt('flandre scarlet', ['fang', 'red footwear', 'slit pupils', 'medium hair', 'blonde hair', 'red eyes', 'red dress', 'mob cap', 'smile', 'short sleeves', 'yellow ascot', 'touhou project'])
+            case 'sanae':
+                text = make_prompt('kochiya sanae', ['green hair', 'blue footwear', 'long hair', 'green eyes', 'white dress', 'blue skirt', 'frog hair ornament', 'snake hair ornament', 'smile', 'standing', 'touhou project'])
+            case 'sanaestand':
+                text = make_prompt('kochiya sanae', ['green hair', 'blue footwear', 'long hair', 'green eyes', 'white dress', 'blue skirt', 'frog hair ornament', 'snake hair ornament', 'smile', 'touhou project'], sitting=False)
+            case 'tenshi':
+                text = make_prompt('hinanawi tenshi', ['blue hair', 'brown footwear', 'slit pupils', 'very long hair', 'red eyes', 'white dress', 'blue skirt', 'hat', 'black headwear', 'smile', 'touhou project'])
+            case 'youmu':
+                text = make_prompt('konpaku youmu', ['silver hair', 'black footwear', 'medium hair', 'slit pupils', 'green eyes', 'green dress', 'sleeveless dress', 'white sleeves', 'black ribbon', 'hair ribbon', 'unhappy', 'touhou project'])
+            case 'yuyuko':
+                text = make_prompt('saigyouji yuyuko', ['pink hair', 'black footwear', 'medium hair', 'pink eyes', 'wide sleeves', 'long sleeves', 'blue dress', 'mob cap', 'touhou project'])
             case 'nagisa':
-                text = 'photo of Itaru Hinoue nagisa furukawa clannad, clannad jacket cosplay {} plush doll with brown hair, brown eyes, chibi smiling, holding brown briefcase, next to dango'.format(placeholder_string)
+                text = make_prompt('furukawa nagisa', ['brown hair', 'brown footwear', 'medium hair', 'brown eyes', 'smile', 'school briefcase', 'blue skirt', 'yellow jacket', 'antenna hair', 'dango', 'clannad'])
             case 'teto':
-                text = 'photo of vocaloid kasane teto {} plush doll with brown hair, brown eyes, chibi smiling'.format(placeholder_string)
+                text = make_prompt('kasane teto', ['pink hair', 'red footwear', 'red eyes', 'medium hair', 'detached sleeves', 'twin drills', 'drill hair', 'grey dress', 'smile', 'vocaloid'])
             case 'korone':
-                text = 'photo of anime girl {} plush doll with yellow jacket, white dress, brown hair, brown eyes, hairclip, uwu face'.format(placeholder_string)
-            case 'kudo1':
-                text = 'photo of kud wafter noumi little busters na-ga {} plush doll with yellow jacket, white dress, brown hair, brown eyes, chibi smiling'.format(placeholder_string)
+                text = make_prompt('inugami korone', ['yellow jacket', 'blue footwear', 'long hair', 'white dress', 'brown hair', 'brown eyes', 'on chair', 'hairclip', 'uwu', 'hololive'], on_floor=False)
+            case 'kudo':
+                text = make_prompt('kudryavka noumi', ['fang', 'black footwear', 'very long hair', 'white hat', 'white cape', 'silver hair', 'grey skirt', 'blue eyes', 'smile', 'little busters!'])
             case 'patchouli':
-                text = 'photo of patchouli touhou {} plush doll chibi unhappy'.format(placeholder_string)
+                text = make_prompt('patchouli knowledge', ['mob cap', 'pink footwear', 'long hair', 'slit pupils', 'striped dress', 'pink dress', 'purple hair', 'ribbons in hair', 'unhappy', 'touhou project'])
             case _:
-                assert False
+                text = f"photo of {placeholder_string}"
 
         example['caption'] = text
 

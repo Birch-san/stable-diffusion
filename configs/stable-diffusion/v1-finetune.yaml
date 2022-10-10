@@ -23,9 +23,10 @@ model:
       target: ldm.modules.embedding_manager.EmbeddingManager
       params:
         placeholder_strings: ["*"]
-        initializer_words: ["plush", "doll"]
+        initializer_words: ["plush"]
         per_image_tokens: false
-        num_vectors_per_token: 6
+        num_vectors_per_token: 8
+        coarse_class_text: "plush"
         progressive_words: False
 
     unet_config:
@@ -83,14 +84,14 @@ data:
         size: 512
         set: train
         per_image_tokens: false
-        repeats: 100
+        repeats: 30
     validation:
       target: ldm.data.personalized.PersonalizedBase
       params:
         size: 512
         set: val
         per_image_tokens: false
-        repeats: 10
+        repeats: 3
 
 lightning:
   modelcheckpoint:

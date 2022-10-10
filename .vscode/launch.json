@@ -129,7 +129,7 @@
         "--actual_resume",
         "./models/ldm/stable-diffusion-v1/model.ckpt",
         "-n",
-        "fumo8",
+        "fumo9",
         "--data_root",
         "/Users/birch/plush/512_ti",
         "--init_word",
