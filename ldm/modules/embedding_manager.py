@@ -146,14 +146,16 @@ class EmbeddingManager(nn.Module):
             placeholder_embedding = self.string_to_param_dict[
                 placeholder_string
             ].to(device)
-            placeholder_token = placeholder_token.detach().clone().to(device)
 
             if (
                 self.max_vectors_per_token == 1
             ):   # If there's only one vector per token, we can do a simple replacement
-                placeholder_idx = torch.where(
-                    tokenized_text == placeholder_token
-                )
+                # don't transfer placeholder_token to MPS device; it'll break (at least at inference time)
+                # https://github.com/invoke-ai/InvokeAI/pull/814/files#r980616497
+                # https://github.com/pytorch/pytorch/issues/86052
+                placeholder_idx = [t.to(device) for t in torch.where(
+                    tokenized_text.cpu() == placeholder_token
+                )]
                 embedded_text[placeholder_idx] = placeholder_embedding
             else:   # otherwise, need to insert and keep track of changing indices
                 if self.progressive_words:
@@ -168,9 +170,9 @@ class EmbeddingManager(nn.Module):
                     placeholder_embedding.shape[0], max_step_tokens
                 )
 
-                placeholder_rows, placeholder_cols = torch.where(
-                    tokenized_text == placeholder_token
-                )
+                placeholder_rows, placeholder_cols = [t.to(device) for t in torch.where(
+                    tokenized_text.cpu() == placeholder_token
+                )]
 
                 if placeholder_rows.nelement() == 0:
                     continue
