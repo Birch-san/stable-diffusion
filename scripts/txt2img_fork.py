@@ -72,6 +72,9 @@ class KCFGDenoiser(nn.Module):
         cond_arities: Iterable[int],
         cond_weights: Optional[Iterable[float]]
     ) -> Tensor:
+        if uncond is None or cond_scale == 1.0:
+            assert cond is None or cond.size(dim=0) == 1, "multi-cond guidance only implemented when CFG is in-use; please pass in an uncond, or use no more than 1 cond"
+            return self.inner_model(x, sigma, cond=cond)
         uncond_count = uncond.size(dim=0)
         cond_count = cond.size(dim=0)
         cond_in = torch.cat((uncond, cond))
