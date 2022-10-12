@@ -12,9 +12,11 @@ from tqdm import tqdm, trange
 from itertools import islice, repeat as repeat_, chain, pairwise
 from einops import rearrange, repeat
 from torchvision.utils import make_grid
+from torchvision import transforms
 import time
 from pytorch_lightning import seed_everything
-from torch import autocast, nn
+from torch import autocast, nn, enable_grad
+from torch.nn import functional as F
 from contextlib import contextmanager, nullcontext
 from random import randint
 from typing import Generic, Optional, Iterable, List, TypeAlias, Tuple, TypeVar, Callable, Protocol, TypedDict
@@ -24,6 +26,10 @@ import abc
 from dataclasses import dataclass
 from enum import Enum
 from inspect import currentframe
+from kornia import augmentation as KA
+import open_clip
+from open_clip import CLIP as OpenCLIP
+# from resize_right import resize
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -31,6 +37,7 @@ from ldm.models.diffusion.plms import PLMSSampler
 
 from k_diffusion.sampling import sample_lms, sample_dpm_2, sample_dpm_2_ancestral, sample_euler, sample_euler_ancestral, sample_heun, sample_dpm_fast, sample_dpm_adaptive, get_sigmas_karras, append_zero
 from k_diffusion.external import CompVisDenoiser
+from k_diffusion.utils import append_dims
 
 def get_device():
     if(torch.cuda.is_available()):
@@ -93,6 +100,82 @@ class CompVisDenoiserWrapper(CompVisDenoiser, DiffusionModelMixin):
     def __init__(self, model: DiffusionModel, quantize=False):
         CompVisDenoiser.__init__(self, model, quantize=quantize)
         DiffusionModelMixin.__init__(self)
+
+def spherical_dist_loss(x: Tensor, y: Tensor) -> Tensor:
+    x = F.normalize(x, dim=-1)
+    y = F.normalize(y, dim=-1)
+    return (x - y).norm(dim=-1).div(2).arcsin().pow(2).mul(2)
+
+class ClipGuidedDenoiser(BaseModelWrapper):
+    clip_model: OpenCLIP
+    clip_augmentations: bool
+    clip_guidance_scale: float
+    clip_normalize: transforms.Normalize
+    clip_size: Tuple[int, int]
+    aug: Optional[KA.RandomAffine]
+    def __init__(
+        self,
+        model: DiffusionModel,
+        clip_model: OpenCLIP,
+        clip_augmentations: bool,
+        clip_guidance_scale: float,
+    ):
+        super().__init__(model)
+        self.clip_model = clip_model
+        self.clip_size = clip_model.visual.image_size
+        self.clip_augmentations = clip_augmentations
+        self.clip_guidance_scale = clip_guidance_scale
+        self.clip_normalize = transforms.Normalize(mean=clip_model.visual.image_mean, std=clip_model.visual.image_std)
+        self.aug = KA.RandomAffine(0, (1/14, 1/14), p=1, padding_mode='border') if clip_augmentations else None
+
+    @enable_grad()
+    def forward(self, x: Tensor, sigma: Tensor, target_embed: Tensor, **kwargs) -> Tensor:
+        x = x.detach().requires_grad_()
+        denoised: Tensor = self.inner_model(x, sigma, **kwargs)
+        cond_grad: Tensor = self.cond_fn(x, denoised=denoised, target_embed=target_embed).detach()
+        ndim = x.ndim
+        del x
+        cond_denoised: Tensor = denoised.detach() + cond_grad * append_dims(sigma**2, ndim)
+        return cond_denoised
+
+    def cond_fn(self, x: Tensor, denoised: Tensor, target_embed: Tensor) -> Tensor:
+        device = denoised.device
+        decoded: Tensor = self.inner_model.differentiable_decode_first_stage(denoised)
+        del denoised
+        renormalized: Tensor = decoded.add(1).div(2)
+        del decoded
+        if self.clip_augmentations:
+            # this particular approach to augmentation crashes on MPS, so we transfer to CPU (for now)
+            # :27:11: error: invalid input tensor shapes, indices shape and updates shape must be equal
+            # -:27:11: note: see current operation: %25 = "mps.scatter_along_axis"(%23, %arg3, %24, %1) {mode = 6 : i32} : (tensor<786432xf32>, tensor<512xf32>, tensor<262144xi32>, tensor<i32>) -> tensor<786432xf32>
+            # TODO: this approach (from k-diffusion example) produces just the one augmentation,
+            #       whereas diffusers approach is to use many and sum their losses. should we?
+            renormalized = self.aug(renormalized.cpu()).to(device) if device.type == 'mps' else self.aug(renormalized)
+        clamped: Tensor = renormalized.clamp(0, 1)
+        del renormalized
+        image_embed: Tensor = self.get_image_embed(clamped)
+        del clamped
+        # TODO: does this do the right thing for multi-sample?
+        # TODO: do we want .mean() here or .sum()? or both?
+        #       k-diffusion example used just .sum(), but k-diff was single-aug. maybe that was for multi-sample?
+        #       whereas diffusers uses .mean() (this seemed to be over a single number, but maybe when you have multiple samples it becomes the mean of the loss over your n samples?),
+        #       then uses sum() (which for multi-aug would sum the losses of each aug)
+        loss: Tensor = spherical_dist_loss(image_embed, target_embed).sum() * self.clip_guidance_scale
+        del image_embed
+        # TODO: does this do the right thing for multi-sample?
+        grad: Tensor = -torch.autograd.grad(loss, x)[0]
+        return grad
+    
+    def get_image_embed(self, x: Tensor) -> Tensor:
+        if x.shape[2:4] != self.clip_size:
+            # k-diffusion example used a bicubic resize, via resize_right library
+            # x = resize(x, out_shape=clip_size, pad_mode='reflect')
+            # but diffusers' bilinear resize produced a nicer bear
+            x = transforms.Resize(self.clip_size)(x)
+        x: Tensor = self.clip_normalize(x)
+        x: FloatTensor = self.clip_model.encode_image(x).float()
+
+        return F.normalize(x)
 
 # samplers from the Karras et al paper
 PRE_KARRAS_K_DIFF_SAMPLERS = { 'k_lms', 'dpm2_ancestral', 'euler_ancestral' }
@@ -488,6 +571,13 @@ def main():
         help="the prompt to render. you can express your prompt as '0.5:piano villain' to halve its effect. negative numbers accepted. try multiple prompts with differing weights. --scale can be used to further amplify the difference between your summed prompts and the unconditional prompt."
     )
     parser.add_argument(
+        "--clip_prompt",
+        type=str,
+        nargs="?",
+        default=None,
+        help="alternative prompt upon which OpenCLIP should guide diffusion."
+    )
+    parser.add_argument(
         "--prompt_interpolation_steps",
         type=int,
         nargs="?",
@@ -581,6 +671,38 @@ def main():
         help=f"when using a Karras sampler ({KARRAS_SAMPLERS}): introduce noise on every sampling step. This gives the same 'creative' effect for which euler ancestral is famous. Currently lacks support for sigma_hat discretization (see https://github.com/crowsonkb/k-diffusion/pull/23).",
     )
     parser.add_argument(
+        "--clip_guidance",
+        action='store_true',
+        help="guides diffusion using OpenCLIP"
+    )
+    parser.add_argument(
+        "--clip_augmentations",
+        action='store_true',
+        help="CLIP-guided diffusion will compute embedding from a subtly-transformed copy of the denoised latents instead of the real thing"
+    )
+    parser.add_argument(
+        "--clip_model_name",
+        type=str,
+        default="ViT-B-32",
+        # big:
+        # --clip_model_name "ViT-H-14" --clip_model_version "laion2b_s32b_b79k"
+        # less big:
+        # --clip_model_name "ViT-B-32" --clip_model_version "laion2b_s34b_b79k"
+        # the big one is slow on Mac (30s/it) and the bear it generated looked worse
+        help="CLIP model name passed to OpenCLIP",
+    )
+    parser.add_argument(
+        "--clip_model_version",
+        type=str,
+        default="laion2b_s34b_b79k",
+        # big:
+        # --clip_model_name "ViT-H-14" --clip_model_version "laion2b_s32b_b79k"
+        # less big:
+        # --clip_model_name "ViT-B-32" --clip_model_version "laion2b_s34b_b79k"
+        # the big one is slow on Mac (30s/it) and the bear it generated looked worse
+        help="CLIP checkpoint name passed to OpenCLIP",
+    )
+    parser.add_argument(
         "--dynamic_thresholding",
         action='store_true',
     )
@@ -657,6 +779,12 @@ def main():
         type=float,
         default=7.5,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
+    )
+    parser.add_argument(
+        "--clip-guidance-scale",
+        type=float,
+        default=500.,
+        help="CLIP guidance scale",
     )
     parser.add_argument(
         "--from-file",
@@ -776,6 +904,17 @@ def main():
         else:
             sampler = DDIMSampler(model)
     
+    clip_model: Optional[OpenCLIP] = None
+    if opt.clip_guidance:
+        assert opt.sampler in K_DIFF_SAMPLERS
+        clip_model: OpenCLIP = open_clip.create_model(opt.clip_model_name, opt.clip_model_version, device=device)
+        clip_model.requires_grad_(False)
+        model_k_guidance = ClipGuidedDenoiser(
+            model=model_k_guidance,
+            clip_model=clip_model,
+            clip_augmentations=opt.clip_augmentations,
+            clip_guidance_scale=opt.clip_guidance_scale,
+        )
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
@@ -928,6 +1067,8 @@ def main():
                 cond_weights: Optional[Iterable[float]] = None
                 cond_arities: Optional[Iterable[int]] = None
                 sample_seeds: Optional[Iterable[int]] = None
+                # used only when CLIP guidance is enabled
+                target_embed: Optional[Tensor] = None
                 for n in trange(opt.n_iter, desc="Iterations", disable=opt.no_progress_bars):
                     iter_tic = time.perf_counter()
                     for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch", disable=opt.no_progress_bars):
@@ -964,6 +1105,14 @@ def main():
                                 case IdenticalSamplesBatchSpec(sample):
                                     # for some reason Python isn't narrowing the type automatically
                                     sample: SampleSpec = sample
+                                    if opt.clip_guidance:
+                                        assert batch_size == 1, "CLIP guidance only implemented for single-sample, single-condition scenario"
+                                        assert len(sample.multiprompt) == 1, "CLIP guidance only implemented for single-sample, single-condition scenario"
+                                        tokens: Tensor = open_clip.tokenize(opt.clip_prompt or sample.multiprompt[0].text).to(device)
+                                        encoded: Tensor = clip_model.encode_text(tokens).to(device)
+                                        del tokens
+                                        target_embed: Tensor = F.normalize(encoded.float())
+                                        del encoded
                                     texts: List[str] = [subprompt.text for subprompt in sample.multiprompt]
                                     cond_arities: Tuple[int, ...] = (len(texts),) * batch_size
                                     cond_weights: List[float] = [subprompt.weight for subprompt in sample.multiprompt] * batch_size
@@ -971,6 +1120,7 @@ def main():
                                     c = repeat_along_dim_0(p, batch_size)
                                     del p
                                 case VariedSamplesBatchSpec(samples):
+                                    assert not opt.clip_guidance, "CLIP guidance only implemented for single-sample, single-condition scenario"
                                     # for some reason Python isn't narrowing the type automatically
                                     samples: List[SampleSpec] = samples
                                     assert len(samples) == batch_size
@@ -1095,6 +1245,7 @@ def main():
                                 'cond_weights': cond_weights,
                                 'cond_arities': cond_arities,
                                 'cond_scale': opt.scale,
+                                'target_embed': target_embed,
                             }
 
                             def log_intermediate(payload: KSamplerCallbackPayload) -> None:
