@@ -112,6 +112,9 @@ lightning:
   trainer:
     # detect_anomaly: True
     benchmark: False
+    # use gradient accumulation to simulate a larger batch size; resist falling into minima
+    # https://github.com/rinongal/textual_inversion/issues/35#issuecomment-1243264108
+    # accumulate_grad_batches: 4
     max_steps: 4000000
 #    max_steps: 4000
     
