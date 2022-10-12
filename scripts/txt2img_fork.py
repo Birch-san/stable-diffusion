@@ -681,6 +681,12 @@ def main():
         help="print denoised latent predictions from each k-diffusion sampler step",
     )
     parser.add_argument(
+        "--no_progress_bars",
+        action='store_true',
+        default=None,
+        help="pass disable=True to tqdm() and trange()",
+    )
+    parser.add_argument(
         "--init_img",
         type=str,
         nargs="?",
@@ -878,9 +884,9 @@ def main():
                 cond_weights: Optional[Iterable[float]] = None
                 cond_arities: Optional[Iterable[int]] = None
                 sample_seeds: Optional[Iterable[int]] = None
-                for n in trange(opt.n_iter, desc="Iterations"):
+                for n in trange(opt.n_iter, desc="Iterations", disable=opt.no_progress_bars):
                     iter_tic = time.perf_counter()
-                    for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch"):
+                    for batch_spec in tqdm(batch_specs, desc=f"Iteration {n}, batch", disable=opt.no_progress_bars):
                         if start_code is None or not opt.fixed_code:
                             first_sample_of_batch_seed = opt.seed if opt.seed is not None and (opt.fixed_code or start_code is None) else randint(np.iinfo(np.uint32).min, np.iinfo(np.uint32).max)
                             if opt.fixed_code_within_batch:
@@ -1057,6 +1063,7 @@ def main():
                                 x,
                                 extra_args=extra_args,
                                 callback=log_intermediate if opt.log_intermediates else None,
+                                disable=opt.no_progress_bars,
                                 **noise_schedule_sampler_args)
 
                         x_samples = model.decode_first_stage(samples)
