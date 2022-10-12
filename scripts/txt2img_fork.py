@@ -23,6 +23,7 @@ from ldm.models.diffusion.ddpm import LatentDiffusion
 import abc
 from dataclasses import dataclass
 from enum import Enum
+from inspect import currentframe
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -38,6 +39,13 @@ def get_device():
         return 'mps'
     else:
         return 'cpu'
+
+def stat(t: Tensor, lineno=True) -> str:
+	min_ = t.min()
+	max_ = t.max()
+	absmax = torch.stack([min_, max_]).abs().max()
+	nominal = "absmax: %.3f\tstd: %.3f\tmin: %.3f\tmax: %.3f\tshape: %s" % (absmax.item(), t.std().item(), min_.item(), max_.item(), list(t.shape))
+	return "L%d\t%s" % (currentframe().f_back.f_lineno, nominal) if lineno else nominal
 
 class KSamplerCallbackPayload(TypedDict):
     x: FloatTensor
