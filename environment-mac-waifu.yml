@@ -10,7 +10,7 @@ dependencies:
   - numpy=1.23.1
   - pip:
     - albumentations==0.4.6
-    - diffusers
+    - diffusers~=0.5.1
     - opencv-python==4.6.0.66
     - opencv-python-headless==4.6.0.66
     - pudb==2019.2
@@ -24,7 +24,7 @@ dependencies:
     - streamlit>=0.73.1
     - einops==0.3.0
     - torch-fidelity==0.3.0
-    - transformers==4.19.2
+    - transformers~=4.21.0
     - torchmetrics==0.7.0
     - kornia==0.6
     - gradio==3.1.6
