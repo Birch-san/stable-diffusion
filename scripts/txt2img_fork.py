@@ -1,4 +1,5 @@
 import argparse, os, sys, glob, fnmatch
+from functools import partial
 import cv2
 from cv2 import randn
 import torch
@@ -15,6 +16,7 @@ from torchvision.utils import make_grid
 import time
 from pytorch_lightning import seed_everything
 from torch import autocast, nn
+from torch.nn import functional as F
 from contextlib import contextmanager, nullcontext
 from random import randint
 from typing import Generic, Optional, Iterable, List, TypeAlias, Tuple, TypeVar, Callable, Protocol, TypedDict
@@ -48,6 +50,10 @@ class KSamplerCallbackPayload(TypedDict):
 
 KSamplerCallback: TypeAlias = Callable[[KSamplerCallbackPayload], None]
 
+T = TypeVar('T')
+Decorator: TypeAlias = Callable[[T], T]
+TensorDecorator: TypeAlias = Decorator[Tensor]
+
 # samplers from the Karras et al paper
 PRE_KARRAS_K_DIFF_SAMPLERS = { 'k_lms', 'dpm2_ancestral', 'euler_ancestral' }
 KARRAS_SAMPLERS = { 'heun', 'euler', 'dpm2' }
@@ -56,12 +62,53 @@ K_DIFF_SAMPLERS = { *KARRAS_SAMPLERS, *PRE_KARRAS_K_DIFF_SAMPLERS, *DPM_SOLVER_S
 NOT_K_DIFF_SAMPLERS = { 'ddim', 'plms' }
 VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
 
-class KCFGDenoiser(nn.Module):
-    inner_model: CompVisDenoiser
-    def __init__(self, model: CompVisDenoiser):
-        super().__init__()
-        self.inner_model = model
+class DiffusionModel(Protocol):
+    scale_factor: float
+    def __call__(self, x: Tensor, sigma: Tensor, **kwargs) -> Tensor: ...
+    def decode_first_stage(self, latents: Tensor) -> Tensor: ...
+    def encode_first_stage(self, pixels: Tensor) -> Tensor: ...
+    def get_first_stage_encoding(self, encoded: Tensor) -> Tensor: ...
 
+class DiffusionModelMixin(DiffusionModel):
+    scale_factor: float
+    inner_model: DiffusionModel
+
+    @property
+    def scale_factor(self) -> float:
+        """
+        notionally this is the standard deviation of latent values encoded by the autoencoder,
+        across the whole dataset upon which it learned.
+        stable-diffusion just went with the standard deviation of the first batch:
+        0.18215
+        """
+        return self.inner_model.scale_factor
+
+    def decode_first_stage(self, latents: Tensor) -> Tensor:
+        return self.inner_model.decode_first_stage(latents)
+
+    def encode_first_stage(self, pixels: Tensor) -> Tensor:
+        return self.inner_model.encode_first_stage(pixels)
+
+    def get_first_stage_encoding(self, encoded: Tensor) -> Tensor:
+        return self.inner_model.get_first_stage_encoding(encoded)
+
+class BaseModelWrapper(nn.Module, DiffusionModelMixin):
+    inner_model: DiffusionModel
+    def __init__(self, inner_model: DiffusionModel):
+        super().__init__()
+        self.inner_model = inner_model
+        DiffusionModelMixin.__init__(self)
+
+# workaround until k-diffusion introduces official base model wrapper,
+# to make the wrapper forward all method calls to the wrapped model
+# https://github.com/crowsonkb/k-diffusion/pull/23#issuecomment-1239937951
+class CompVisDenoiserWrapper(CompVisDenoiser, DiffusionModelMixin):
+    inner_model: DiffusionModel
+    def __init__(self, model: DiffusionModel, quantize=False):
+        CompVisDenoiser.__init__(self, model, quantize=quantize)
+        DiffusionModelMixin.__init__(self)
+
+class KCFGDenoiser(BaseModelWrapper):
     def forward(
         self,
         x: Tensor,
@@ -97,6 +144,74 @@ class KCFGDenoiser(nn.Module):
         del deltas
         return uncond_out + cond
 
+
+def dynamic_threshold(percentile: float, floor: float, t: Tensor) -> Tensor:
+    r"""
+    Args:
+        percentile: float between 0.0 and 1.0. for example 0.995 would subject only the top 0.5%ile to clamping.
+        t: [b, c, h, w] tensor in pixel or latent space.
+    """
+    device = t.device
+    # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
+    # adapted from lucidrains' imagen_pytorch (MIT-licensed)
+    flattened = rearrange(t, 'b c ... -> b c (...)').abs()
+    # aten::sort.values_stable not implemented for MPS
+    sort_on_cpu = device.type == 'mps'
+    flattened = flattened.cpu() if sort_on_cpu else flattened
+    # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
+    s = torch.quantile(
+        flattened,
+        percentile,
+        dim = 2
+    )
+    s = s.to(device) if sort_on_cpu else s
+    s.clamp_(min = 1.)
+    s = right_pad_dims_to(t, s)
+    # MPS complains min and input tensors must be of the same shape
+
+    clamp_tensors_on_cpu = device.type == 'mps'
+    s_orig = s
+    neg_s = -s
+    s = s.cpu() if clamp_tensors_on_cpu else s
+    neg_s = neg_s.cpu() if clamp_tensors_on_cpu else neg_s
+    pixels = t.cpu() if clamp_tensors_on_cpu else t
+    pixels = pixels.clamp(neg_s, s)
+    pixels = pixels.to(device) if clamp_tensors_on_cpu else pixels
+    pixels = pixels / s_orig
+    return pixels
+
+class DynamicThresholdingDenoiser(BaseModelWrapper):
+    apply_threshold: TensorDecorator
+    floor: float
+    def __init__(self, model: DiffusionModel, percentile: float, floor: float):
+        super().__init__(model)
+        self.apply_threshold = partial(dynamic_threshold, percentile, floor)
+        self.floor = floor
+
+    def forward(
+        self,
+        x: FloatTensor,
+        sigma: FloatTensor,
+        cond: FloatTensor,
+        **kwargs,
+    ) -> FloatTensor:
+        # thanks to @marunine for explaining how to apply dynamic thresholding to scaled latents
+        latents: FloatTensor = self.inner_model(x, sigma, cond=cond, **kwargs)
+        magnitude: Tensor = latents.abs().max()
+        if magnitude < self.floor:
+            return latents
+        unscaled: Tensor = latents / self.scale_factor
+        del latents
+        normalized: Tensor = F.normalize(unscaled, dim=-1)
+        del unscaled
+        thresholded: Tensor = self.apply_threshold(normalized)
+        del normalized
+        denormalized: Tensor = thresholded * magnitude
+        del thresholded, magnitude
+        new_latents = denormalized * self.scale_factor
+        del denormalized
+        return new_latents
+
 # from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 # from transformers import AutoFeatureExtractor
 
@@ -110,8 +225,6 @@ class KCFGDenoiser(nn.Module):
 def chunk(it, size):
     it = iter(it)
     return iter(lambda: tuple(islice(it, size)), ())
-
-T = TypeVar('T')
 
 @dataclass
 class InBetweenParams(Generic[T]):
@@ -546,6 +659,11 @@ def main():
         default=0.9995,
     )
     parser.add_argument(
+        "--dynamic_thresholding_floor",
+        type=float,
+        default=3.,
+    )
+    parser.add_argument(
         "--laion400m",
         action='store_true',
         help="uses the LAION400M model",
@@ -718,7 +836,7 @@ def main():
     latents_to_pils: LatentsToPils = make_latents_to_pils(model)
 
     if opt.sampler in K_DIFF_SAMPLERS:
-        model_k_wrapped = CompVisDenoiser(model, quantize=True)
+        model_k_wrapped = CompVisDenoiserWrapper(model, quantize=True)
         model_k_guidance = KCFGDenoiser(model_k_wrapped)
     elif opt.sampler in NOT_K_DIFF_SAMPLERS:
         if opt.sampler == 'plms':
@@ -726,6 +844,12 @@ def main():
         else:
             sampler = DDIMSampler(model)
     
+    if opt.dynamic_thresholding:
+        model_k_guidance = DynamicThresholdingDenoiser(
+            model_k_guidance,
+            opt.dynamic_thresholding_percentile,
+            opt.dynamic_thresholding_floor,
+        )
 
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
@@ -1060,34 +1184,6 @@ def main():
                                 **noise_schedule_sampler_args)
 
                         x_samples = model.decode_first_stage(samples)
-
-                        if opt.dynamic_thresholding:
-                            # https://github.com/lucidrains/imagen-pytorch/blob/ceb23d62ecf611082c82b94f2625d78084738ced/imagen_pytorch/imagen_pytorch.py#L1982
-                            # adapted from lucidrains' imagen_pytorch (MIT-licensed)
-                            flattened = rearrange(x_samples, 'a b ... -> a b (...)').abs()
-                            # aten::sort.values_stable not implemented for MPS
-                            sort_on_cpu = device.type == 'mps'
-                            flattened = flattened.cpu() if sort_on_cpu else flattened
-                            # implementation of pseudocode from Imagen paper https://arxiv.org/abs/2205.11487 Section E, A.32
-                            s = torch.quantile(
-                                flattened,
-                                opt.dynamic_thresholding_percentile,
-                                dim = 2
-                            )
-                            s = s.to(device) if sort_on_cpu else s
-                            s.clamp_(min = 1.)
-                            s = right_pad_dims_to(x_samples, s)
-                            # MPS complains min and input tensors must be of the same shape
-
-                            clamp_tensors_on_cpu = device.type == 'mps'
-                            s_orig = s
-                            neg_s = -s
-                            s = s.cpu() if clamp_tensors_on_cpu else s
-                            neg_s = neg_s.cpu() if clamp_tensors_on_cpu else neg_s
-                            x_samples = x_samples.cpu() if clamp_tensors_on_cpu else x_samples
-                            x_samples = x_samples.clamp(neg_s, s)
-                            x_samples = x_samples.to(device) if clamp_tensors_on_cpu else x_samples
-                            x_samples = x_samples / s_orig
                         
                         x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
                         x_samples = x_samples.cpu().permute(0, 2, 3, 1).numpy()
