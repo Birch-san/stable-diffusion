@@ -48,6 +48,40 @@ class KSamplerCallbackPayload(TypedDict):
 
 KSamplerCallback: TypeAlias = Callable[[KSamplerCallbackPayload], None]
 
+class DiffusionModel(Protocol):
+    def __call__(self, x: Tensor, sigma: Tensor, **kwargs) -> Tensor: ...
+    def decode_first_stage(self, latents: Tensor) -> Tensor: ...
+    def encode_first_stage(self, pixels: Tensor) -> Tensor: ...
+    def get_first_stage_encoding(self, encoded: Tensor) -> Tensor: ...
+
+class DiffusionModelMixin(DiffusionModel):
+    inner_model: DiffusionModel
+
+    def decode_first_stage(self, latents: Tensor) -> Tensor:
+        return self.inner_model.decode_first_stage(latents)
+
+    def encode_first_stage(self, pixels: Tensor) -> Tensor:
+        return self.inner_model.encode_first_stage(pixels)
+
+    def get_first_stage_encoding(self, encoded: Tensor) -> Tensor:
+        return self.inner_model.get_first_stage_encoding(encoded)
+
+class BaseModelWrapper(nn.Module, DiffusionModelMixin):
+    inner_model: DiffusionModel
+    def __init__(self, inner_model: DiffusionModel):
+        super().__init__()
+        self.inner_model = inner_model
+        DiffusionModelMixin.__init__(self)
+
+# workaround until k-diffusion introduces official base model wrapper,
+# to make the wrapper forward all method calls to the wrapped model
+# https://github.com/crowsonkb/k-diffusion/pull/23#issuecomment-1239937951
+class CompVisDenoiserWrapper(CompVisDenoiser, DiffusionModelMixin):
+    inner_model: DiffusionModel
+    def __init__(self, model: DiffusionModel, quantize=False):
+        CompVisDenoiser.__init__(self, model, quantize=quantize)
+        DiffusionModelMixin.__init__(self)
+
 # samplers from the Karras et al paper
 PRE_KARRAS_K_DIFF_SAMPLERS = { 'k_lms', 'dpm2_ancestral', 'euler_ancestral' }
 KARRAS_SAMPLERS = { 'heun', 'euler', 'dpm2' }
@@ -56,12 +90,7 @@ K_DIFF_SAMPLERS = { *KARRAS_SAMPLERS, *PRE_KARRAS_K_DIFF_SAMPLERS, *DPM_SOLVER_S
 NOT_K_DIFF_SAMPLERS = { 'ddim', 'plms' }
 VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
 
-class KCFGDenoiser(nn.Module):
-    inner_model: CompVisDenoiser
-    def __init__(self, model: CompVisDenoiser):
-        super().__init__()
-        self.inner_model = model
-
+class KCFGDenoiser(BaseModelWrapper):
     def forward(
         self,
         x: Tensor,
@@ -727,7 +756,7 @@ def main():
     latents_to_pils: LatentsToPils = make_latents_to_pils(model)
 
     if opt.sampler in K_DIFF_SAMPLERS:
-        model_k_wrapped = CompVisDenoiser(model, quantize=True)
+        model_k_wrapped = CompVisDenoiserWrapper(model, quantize=True)
         model_k_guidance = KCFGDenoiser(model_k_wrapped)
     elif opt.sampler in NOT_K_DIFF_SAMPLERS:
         if opt.sampler == 'plms':
