@@ -24,7 +24,7 @@ dependencies:
     - streamlit>=0.73.1
     - einops==0.3.0
     - torch-fidelity==0.3.0
-    - transformers==4.19.2
+    - transformers==4.23.1
     - torchmetrics==0.7.0
     - kornia==0.6
     - gradio==3.1.6

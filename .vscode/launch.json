@@ -173,6 +173,18 @@
         "--extractpath",
         "outputs"
       ]
+    },
+    {
+      "name": "Python: coreml_play",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/coreml_play.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [],
+      "env": {
+        "PYTORCH_ENABLE_MPS_FALLBACK": "1"
+      }
     }
   ]
 }
