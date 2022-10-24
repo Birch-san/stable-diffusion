@@ -14,3 +14,4 @@ __pycache__/
 /booru_caption.json
 /logs/
 /prompts.txt
+*.mlpackage
