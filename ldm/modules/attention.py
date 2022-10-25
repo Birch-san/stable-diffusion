@@ -2,7 +2,8 @@ from inspect import isfunction
 import math
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum
+from torch.nn import MultiheadAttention
+from torch import nn, einsum, Tensor
 from einops import rearrange, repeat
 
 from ldm.modules.diffusionmodules.util import checkpoint
@@ -148,15 +149,21 @@ class SpatialSelfAttention(nn.Module):
 
         return x+h_
 
-
-class CrossAttention(nn.Module):
+    
+class CrossAttention(MultiheadAttention):
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
-        super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
-        self.scale = dim_head ** -0.5
-        self.heads = heads
+        super().__init__(
+            embed_dim=inner_dim,
+            # kdim=context_dim,
+            # vdim=context_dim,
+            bias=False,
+            dropout=dropout,
+            batch_first=True,
+            num_heads=heads,
+        )
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
@@ -166,10 +173,8 @@ class CrossAttention(nn.Module):
             nn.Linear(inner_dim, query_dim),
             nn.Dropout(dropout)
         )
-
+    
     def forward(self, x, context=None, mask=None):
-        h = self.heads
-
         q = self.to_q(x)
         context = default(context, x)
         del x
@@ -177,27 +182,14 @@ class CrossAttention(nn.Module):
         v = self.to_v(context)
         del context
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
-
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-        del q, k
-
-        if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
-            del mask
-
-        # attention, what we cannot get enough of
-        attn = sim.softmax(dim=-1)
-        del sim
-
-        out = einsum('b i j, b j d -> b i d', attn, v)
-        del attn, v
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        del h
-        return self.to_out(out)
+        out, _ = super().forward(
+            query=q,
+            key=k,
+            value=v,
+            need_weights=False,
+        )
+        # make contiguous to help MPS backend on pytorch 1.12.1 (keep happy the layernorm downstream of us)
+        return out.contiguous()
 
 
 class BasicTransformerBlock(nn.Module):
