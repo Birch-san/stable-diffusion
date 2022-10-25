@@ -61,7 +61,9 @@ def bipartite_soft_matching(
 
         unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens
         src_idx = edge_idx[..., :r, :]  # Merged Tokens
-        dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
+        # workaround for PyTorch 1.12.1 MPS backend; gather on-CPU
+        # dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
+        dst_idx = node_idx[..., None].cpu().gather(dim=-2, index=src_idx.cpu()).to(src_idx.device)
 
         if class_token:
             # Sort to ensure the class token is at the start
