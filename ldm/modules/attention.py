@@ -1,12 +1,19 @@
+from dataclasses import dataclass
 from inspect import isfunction
 import math
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum
+from torch import nn, einsum, Tensor
 from einops import rearrange, repeat
+from typing import Optional, NamedTuple, List
 
 from ldm.modules.diffusionmodules.util import checkpoint
+from ldm.modules.tome.merge import bipartite_soft_matching, merge_source, merge_wavg
+from ldm.modules.tome.utils import parse_r
 
+class CrossAttentionResult(NamedTuple):
+    out: Tensor
+    metric: Tensor
 
 def exists(val):
     return val is not None
@@ -167,7 +174,7 @@ class CrossAttention(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x, context=None, mask=None):
+    def forward(self, x, context=None, mask=None, size:Optional[Tensor]=None) -> CrossAttentionResult:
         h = self.heads
 
         q = self.to_q(x)
@@ -180,7 +187,7 @@ class CrossAttention(nn.Module):
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-        del q, k
+        del q#, k
 
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
@@ -188,6 +195,10 @@ class CrossAttention(nn.Module):
             mask = repeat(mask, 'b j -> (b h) () j', h=h)
             sim.masked_fill_(~mask, max_neg_value)
             del mask
+        
+        # Apply proportional attention
+        if size is not None:
+            attn = attn + size.log()[:, None, None, :, 0]
 
         # attention, what we cannot get enough of
         attn = sim.softmax(dim=-1)
@@ -197,12 +208,27 @@ class CrossAttention(nn.Module):
         del attn, v
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         del h
-        return self.to_out(out)
+        k_mean = k.mean(1)
+        return CrossAttentionResult(
+            out=self.to_out(out),
+            metric=k_mean
+        )
 
+@dataclass
+class ToMeInfo:
+    r: List[int]
+    size: Optional[int]
+    source: Optional[Tensor]
+    trace_source: bool
+    prop_attn: bool
+    class_token: bool
+    distill_token: bool
 
 class BasicTransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
+    _tome_info: ToMeInfo
+    def __init__(self, dim, n_heads, d_head, _tome_info: ToMeInfo, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
         super().__init__()
+        self._tome_info=_tome_info
         self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
         self.attn2 = CrossAttention(query_dim=dim, context_dim=context_dim,
@@ -217,13 +243,52 @@ class BasicTransformerBlock(nn.Module):
 
     def _forward(self, x, context=None):
         x = x.contiguous() if x.device.type == 'mps' else x
-        x = self.attn1(self.norm1(x)) + x
-        x = self.attn2(self.norm2(x), context=context) + x
+        attn_size = self._tome_info.size if self._tome_info.prop_attn else None
+        x_attn, metric = self.attn1(self.norm1(x), size=attn_size)
+        x = x_attn + x
+        del x_attn
+
+        r = self._tome_info.r.pop(0)
+        if r > 0:
+            # Apply ToMe here
+            merge, _ = bipartite_soft_matching(
+                metric,
+                r,
+                self._tome_info.class_token,
+                self._tome_info.distill_token,
+            )
+            if self._tome_info.trace_source:
+                self._tome_info.source = merge_source(
+                    merge, x, self._tome_info.source
+                )
+            x, self._tome_info.size = merge_wavg(merge, x, self._tome_info.size)
+
+        x_attn, metric = self.attn2(self.norm2(x), context=context, size=attn_size)
+        x = x_attn + x
+        del x_attn
+
+        r = self._tome_info.r.pop(0)
+        if r > 0:
+            # Apply ToMe here
+            merge, _ = bipartite_soft_matching(
+                metric,
+                r,
+                self._tome_info.class_token,
+                self._tome_info.distill_token,
+            )
+            if self._tome_info.trace_source:
+                self._tome_info.source = merge_source(
+                    merge, x, self._tome_info.source
+                )
+            x, self._tome_info.size = merge_wavg(merge, x, self._tome_info.size)
+
         x = self.ff(self.norm3(x)) + x
         return x
 
-
 class SpatialTransformer(nn.Module):
+    # number of tokens reduced per layer
+    r: int
+    _tome_info: ToMeInfo
     """
     Transformer block for image-like data.
     First, project the input (aka embedding)
@@ -243,9 +308,19 @@ class SpatialTransformer(nn.Module):
                                  kernel_size=1,
                                  stride=1,
                                  padding=0)
-
+        # TODO: expose r somewhere the user can fiddle with it
+        self.r = 4
+        self._tome_info = ToMeInfo(
+            r=[],
+            size=None,
+            source=None,
+            trace_source=False,
+            prop_attn=True,
+            class_token=False,#model.cls_token is not None,
+            distill_token=False,
+        )
         self.transformer_blocks = nn.ModuleList(
-            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim)
+            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim, _tome_info=self._tome_info)
                 for d in range(depth)]
         )
 
@@ -262,6 +337,11 @@ class SpatialTransformer(nn.Module):
         x = self.norm(x)
         x = self.proj_in(x)
         x = rearrange(x, 'b c h w -> b (h w) c')
+
+        
+        self._tome_info.r = parse_r(len(self.transformer_blocks) * 2, self.r)
+        self._tome_info.size = None
+        self._tome_info.source = None
         for block in self.transformer_blocks:
             x = block(x, context=context)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
