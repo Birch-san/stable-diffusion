@@ -5,15 +5,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn, einsum, Tensor
 from einops import rearrange, repeat
-from typing import Optional, NamedTuple, List
+from typing import Optional
 
 from ldm.modules.diffusionmodules.util import checkpoint
 from ldm.modules.tome.merge import bipartite_soft_matching, merge_source, merge_wavg
-from ldm.modules.tome.utils import parse_r
-
-class CrossAttentionResult(NamedTuple):
-    out: Tensor
-    metric: Tensor
+from ldm.modules.tome.tome_info import ToMeInfo
 
 def exists(val):
     return val is not None
@@ -155,10 +151,11 @@ class SpatialSelfAttention(nn.Module):
 
         return x+h_
 
-
 class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+    _tome_info: ToMeInfo
+    def __init__(self, query_dim, _tome_info: ToMeInfo, context_dim=None, heads=8, dim_head=64, dropout=0.):
         super().__init__()
+        self._tome_info = _tome_info
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
@@ -174,7 +171,8 @@ class CrossAttention(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x, context=None, mask=None, size:Optional[Tensor]=None) -> CrossAttentionResult:
+    def forward(self, x, context=None, mask=None, size:Optional[Tensor]=None) -> Tensor: #CrossAttentionResult:
+        is_self_attention = context is None
         h = self.heads
 
         q = self.to_q(x)
@@ -183,14 +181,49 @@ class CrossAttention(nn.Module):
         k = self.to_k(context)
         v = self.to_v(context)
         del context
-        k_heads_extracted: Tensor = rearrange(k, 'b n (h d) -> b n h d', h=h)
-        k_mean = k_heads_extracted.mean(-2)
-        del k_heads_extracted
+
+        if is_self_attention:
+            r = self._tome_info.r.pop(0)
+            if r > 0:
+                # Apply ToMe here
+                k_heads_extracted: Tensor = rearrange(k, 'b n (h d) -> b n h d', h=h)
+                k_mean = k_heads_extracted.mean(-2)
+                del k_heads_extracted
+                v_heads_extracted: Tensor = rearrange(v, 'b n (h d) -> b n h d', h=h)
+                v_mean = v_heads_extracted.mean(-2)
+                del v_heads_extracted
+
+                merge, _ = bipartite_soft_matching(
+                    k_mean,
+                    r,
+                    self._tome_info.class_token,
+                    self._tome_info.distill_token,
+                )
+                del k_mean
+                if self._tome_info.trace_source:
+                    self._tome_info.source = merge_source(
+                        merge, k, self._tome_info.source
+                    )
+                k, self._tome_info.size = merge_wavg(merge, k, self._tome_info.size)
+
+                merge, _ = bipartite_soft_matching(
+                    v_mean,
+                    r,
+                    self._tome_info.class_token,
+                    self._tome_info.distill_token,
+                )
+                del v_mean
+                if self._tome_info.trace_source:
+                    self._tome_info.source = merge_source(
+                        merge, v, self._tome_info.source
+                    )
+                v, self._tome_info.size = merge_wavg(merge, v, self._tome_info.size)
+                del merge
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-        del q#, k
+        del q, k
 
         if exists(mask):
             mask = rearrange(mask, 'b ... -> b (...)')
@@ -210,30 +243,20 @@ class CrossAttention(nn.Module):
         out = einsum('b i j, b j d -> b i d', attn, v)
         del attn, v
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        del h
-        return CrossAttentionResult(
-            out=self.to_out(out),
-            metric=k_mean
-        )
+        return self.to_out(out)
 
-@dataclass
-class ToMeInfo:
-    r: List[int]
-    size: Optional[int]
-    source: Optional[Tensor]
-    trace_source: bool
-    prop_attn: bool
-    class_token: bool
-    distill_token: bool
 
 class BasicTransformerBlock(nn.Module):
     _tome_info: ToMeInfo
     def __init__(self, dim, n_heads, d_head, _tome_info: ToMeInfo, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
         super().__init__()
+        # we contribute one self-attention layer (i.e. CrossAttn with context=None);
+        # ToMe will be applied to self-attention, so increment candidates
+        _tome_info.candidates += 1
         self._tome_info=_tome_info
-        self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
+        self.attn1 = CrossAttention(query_dim=dim, _tome_info=_tome_info, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
-        self.attn2 = CrossAttention(query_dim=dim, context_dim=context_dim,
+        self.attn2 = CrossAttention(query_dim=dim, _tome_info=_tome_info, context_dim=context_dim,
                                     heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
@@ -245,51 +268,12 @@ class BasicTransformerBlock(nn.Module):
 
     def _forward(self, x, context=None):
         x = x.contiguous() if x.device.type == 'mps' else x
-        attn_size = self._tome_info.size if self._tome_info.prop_attn else None
-        x_attn, metric = self.attn1(self.norm1(x), size=attn_size)
-        x = x_attn + x
-        del x_attn
-
-        r = self._tome_info.r.pop(0)
-        if r > 0:
-            # Apply ToMe here
-            merge, _ = bipartite_soft_matching(
-                metric,
-                r,
-                self._tome_info.class_token,
-                self._tome_info.distill_token,
-            )
-            if self._tome_info.trace_source:
-                self._tome_info.source = merge_source(
-                    merge, x, self._tome_info.source
-                )
-            x, self._tome_info.size = merge_wavg(merge, x, self._tome_info.size)
-
-        x_attn, metric = self.attn2(self.norm2(x), context=context, size=attn_size)
-        x = x_attn + x
-        del x_attn
-
-        r = self._tome_info.r.pop(0)
-        if r > 0:
-            # Apply ToMe here
-            merge, _ = bipartite_soft_matching(
-                metric,
-                r,
-                self._tome_info.class_token,
-                self._tome_info.distill_token,
-            )
-            if self._tome_info.trace_source:
-                self._tome_info.source = merge_source(
-                    merge, x, self._tome_info.source
-                )
-            x, self._tome_info.size = merge_wavg(merge, x, self._tome_info.size)
-
+        x = self.attn1(self.norm1(x)) + x
+        x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
         return x
 
 class SpatialTransformer(nn.Module):
-    # number of tokens reduced per layer
-    r: int
     _tome_info: ToMeInfo
     """
     Transformer block for image-like data.
@@ -298,11 +282,12 @@ class SpatialTransformer(nn.Module):
     Then apply standard transformer action.
     Finally, reshape to image
     """
-    def __init__(self, in_channels, n_heads, d_head,
+    def __init__(self, in_channels, n_heads, d_head, _tome_info: ToMeInfo,
                  depth=1, dropout=0., context_dim=None):
         super().__init__()
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
+        self._tome_info = _tome_info
         self.norm = Normalize(in_channels)
 
         self.proj_in = nn.Conv2d(in_channels,
@@ -310,19 +295,8 @@ class SpatialTransformer(nn.Module):
                                  kernel_size=1,
                                  stride=1,
                                  padding=0)
-        # TODO: expose r somewhere the user can fiddle with it
-        self.r = 4
-        self._tome_info = ToMeInfo(
-            r=[],
-            size=None,
-            source=None,
-            trace_source=False,
-            prop_attn=True,
-            class_token=False,#model.cls_token is not None,
-            distill_token=False,
-        )
         self.transformer_blocks = nn.ModuleList(
-            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim, _tome_info=self._tome_info)
+            [BasicTransformerBlock(inner_dim, n_heads, d_head, _tome_info=self._tome_info, dropout=dropout, context_dim=context_dim)
                 for d in range(depth)]
         )
 
@@ -340,10 +314,6 @@ class SpatialTransformer(nn.Module):
         x = self.proj_in(x)
         x = rearrange(x, 'b c h w -> b (h w) c')
 
-        
-        self._tome_info.r = parse_r(len(self.transformer_blocks) * 2, self.r)
-        self._tome_info.size = None
-        self._tome_info.source = None
         for block in self.transformer_blocks:
             x = block(x, context=context)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)

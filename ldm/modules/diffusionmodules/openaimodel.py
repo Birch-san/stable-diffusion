@@ -18,6 +18,8 @@ from ldm.modules.diffusionmodules.util import (
     timestep_embedding,
 )
 from ldm.modules.attention import SpatialTransformer
+from ldm.modules.tome.tome_info import ToMeInfo
+from ldm.modules.tome.utils import parse_r
 
 
 # dummy replace
@@ -411,6 +413,9 @@ class QKVAttention(nn.Module):
 
 
 class UNetModel(nn.Module):
+    # number of tokens reduced per layer
+    r: int
+    _tome_info: ToMeInfo
     """
     The full UNet model with attention and timestep embedding.
     :param in_channels: channels in the input Tensor.
@@ -485,6 +490,21 @@ class UNetModel(nn.Module):
 
         if num_head_channels == -1:
             assert num_heads != -1, 'Either num_heads or num_head_channels has to be set'
+        
+        # TODO: expose r somewhere the user can fiddle with it
+        self.r = 1024
+        self._tome_info = ToMeInfo(
+            # each SpatialTransformer we construct will increment `candidates`, telling us on how many layers _tome will be applied
+            # in practice: 16
+            candidates=0,
+            r=[],
+            size=None,
+            source=None,
+            trace_source=False,
+            prop_attn=True,
+            class_token=False,#model.cls_token is not None,
+            distill_token=False,
+        )
 
         self.image_size = image_size
         self.in_channels = in_channels
@@ -555,7 +575,7 @@ class UNetModel(nn.Module):
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
                         ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, _tome_info=self._tome_info, depth=transformer_depth, context_dim=context_dim
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -610,7 +630,7 @@ class UNetModel(nn.Module):
                 num_head_channels=dim_head,
                 use_new_attention_order=use_new_attention_order,
             ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, _tome_info=self._tome_info, depth=transformer_depth, context_dim=context_dim
                         ),
             ResBlock(
                 ch,
@@ -656,7 +676,7 @@ class UNetModel(nn.Module):
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
                         ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, _tome_info=self._tome_info, depth=transformer_depth, context_dim=context_dim
                         )
                     )
                 if level and i == num_res_blocks:
@@ -719,6 +739,12 @@ class UNetModel(nn.Module):
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
+        # each SpatialTransformer we constructed incremented `candidates`, telling us on how many layers _tome will be applied
+        # in practice: 16
+        self._tome_info.r = parse_r(self._tome_info.candidates, self.r)
+        self._tome_info.size = None
+        self._tome_info.source = None
+        
         hs = []
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
