@@ -72,8 +72,15 @@ def bipartite_soft_matching(
     def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
         src, dst = x[..., ::2, :], x[..., 1::2, :]
         n, t1, c = src.shape
-        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
-        src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
+        unm_idx_ex = unm_idx.expand(n, t1 - r, c)
+        src_idx_ex = src_idx.expand(n, r, c)
+        if c == 1:
+            # prevent crash on PyTorch 1.12.1 MPS backend
+            unm = src.cpu().gather(dim=-2, index=unm_idx_ex.cpu()).to(src.device)
+            src = src.cpu().gather(dim=-2, index=src_idx_ex.cpu()).to(src.device)
+        else:
+            unm = src.gather(dim=-2, index=unm_idx_ex)
+            src = src.gather(dim=-2, index=src_idx_ex)
         dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
 
         if distill_token:

@@ -208,7 +208,7 @@ class CrossAttention(nn.Module):
         del attn, v
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         del h
-        k_mean = k.mean(1)
+        k_mean = k.mean(0)
         return CrossAttentionResult(
             out=self.to_out(out),
             metric=k_mean
