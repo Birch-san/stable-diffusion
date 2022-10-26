@@ -183,6 +183,9 @@ class CrossAttention(nn.Module):
         k = self.to_k(context)
         v = self.to_v(context)
         del context
+        k_heads_extracted: Tensor = rearrange(k, 'b n (h d) -> b n h d', h=h)
+        k_mean = k_heads_extracted.mean(-2)
+        del k_heads_extracted
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
@@ -208,7 +211,6 @@ class CrossAttention(nn.Module):
         del attn, v
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         del h
-        k_mean = k.mean(0)
         return CrossAttentionResult(
             out=self.to_out(out),
             metric=k_mean
