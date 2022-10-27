@@ -6,7 +6,7 @@
 # --------------------------------------------------------
 
 import math
-from typing import Callable, Tuple
+from typing import Callable, Tuple, NamedTuple, Union
 
 import torch
 
@@ -61,9 +61,11 @@ def bipartite_soft_matching(
 
         unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens
         src_idx = edge_idx[..., :r, :]  # Merged Tokens
-        # workaround for PyTorch 1.12.1 MPS backend; gather on-CPU
-        # dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
-        dst_idx = node_idx[..., None].cpu().gather(dim=-2, index=src_idx.cpu()).to(src_idx.device)
+        if src_idx.device.type == 'mps':
+            # workaround for PyTorch 1.12.1 MPS backend; gather on-CPU
+            dst_idx = node_idx[..., None].cpu().gather(dim=-2, index=src_idx.cpu()).to(src_idx.device)
+        else:
+            dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
 
         if class_token:
             # Sort to ensure the class token is at the start
@@ -74,7 +76,7 @@ def bipartite_soft_matching(
         n, t1, c = src.shape
         unm_idx_ex = unm_idx.expand(n, t1 - r, c)
         src_idx_ex = src_idx.expand(n, r, c)
-        if c == 1:
+        if c == 1 and src.device.type == 'mps':
             # prevent crash on PyTorch 1.12.1 MPS backend
             unm = src.cpu().gather(dim=-2, index=unm_idx_ex.cpu()).to(src.device)
             src = src.cpu().gather(dim=-2, index=src_idx_ex.cpu()).to(src.device)
@@ -232,17 +234,20 @@ def merge_wavg(
     x = x / size
     return x, size
 
+class SourceDims(NamedTuple):
+    batch_size: int
+    token_count: int
 
 def merge_source(
-    merge: Callable, x: torch.Tensor, source: torch.Tensor = None
+    merge: Callable, source_dims: SourceDims, source: torch.Tensor = None, device: Union[torch.device, str] = 'cpu'
 ) -> torch.Tensor:
     """
     For source tracking. Source is an adjacency matrix between the initial tokens and final merged groups.
     x is used to find out how many tokens there are in case the source is None.
     """
     if source is None:
-        n, t, _ = x.shape
-        source = torch.eye(t, device=x.device)[None, ...].expand(n, t, t)
+        batch_size, token_count = source_dims
+        source = torch.eye(token_count, device=device)[None, ...].expand(batch_size, token_count, token_count)
 
     source = merge(source, mode="amax")
     return source

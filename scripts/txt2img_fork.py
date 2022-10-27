@@ -23,6 +23,8 @@ from ldm.models.diffusion.ddpm import LatentDiffusion
 import abc
 from dataclasses import dataclass
 from enum import Enum
+from ldm.modules.tome.layer import ToMeLayer
+from ldm.modules.tome.params import GetMergeParams, KthBipartiteParams, MergeParams
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -90,6 +92,15 @@ K_DIFF_SAMPLERS = { *KARRAS_SAMPLERS, *PRE_KARRAS_K_DIFF_SAMPLERS, *DPM_SOLVER_S
 NOT_K_DIFF_SAMPLERS = { 'ddim', 'plms' }
 VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
 
+
+def make_get_merge_params(sigma: float) -> GetMergeParams:
+    def get_merge_params(
+        token_count: int,
+        layer: ToMeLayer
+    ) -> MergeParams:
+        return KthBipartiteParams(k=2)
+    return get_merge_params
+
 class KCFGDenoiser(BaseModelWrapper):
     def forward(
         self,
@@ -112,8 +123,9 @@ class KCFGDenoiser(BaseModelWrapper):
         x_in = cat_self_with_repeat_interleaved(t=x, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
         del x
         sigma_in = cat_self_with_repeat_interleaved(t=sigma, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
+        get_merge_params: GetMergeParams = make_get_merge_params(sigma.item())
         del sigma
-        uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in).split([uncond_count, cond_count])
+        uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in, get_merge_params=get_merge_params).split([uncond_count, cond_count])
         del x_in, sigma_in, cond_in
         unconds = repeat_interleave_along_dim_0(t=uncond_out, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
         del cond_arities_tensor
