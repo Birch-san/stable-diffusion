@@ -1,6 +1,6 @@
 from abc import ABC
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Optional, Protocol
 
 from ldm.modules.tome.layer import ToMeLayer
 
@@ -27,4 +27,4 @@ class GetMergeParams(Protocol):
   def __call__(
     token_count: int,
     layer: ToMeLayer
-  ) -> MergeParams: ...
+  ) -> Optional[MergeParams]: ...

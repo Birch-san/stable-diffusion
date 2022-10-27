@@ -98,8 +98,10 @@ def make_get_merge_params(sigma: float) -> GetMergeParams:
     def get_merge_params(
         token_count: int,
         layer: ToMeLayer
-    ) -> MergeParams:
-        return KthBipartiteParams(k=2)
+    ) -> Optional[MergeParams]:
+        if token_count >= 1024:
+            return KthBipartiteParams(k=4)
+        return None
     return get_merge_params
 
 class KCFGDenoiser(BaseModelWrapper):

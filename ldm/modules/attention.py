@@ -190,42 +190,42 @@ class CrossAttention(nn.Module):
         del context
 
         if is_self_attention and callable(get_merge_params):
-            merge_params: MergeParams = get_merge_params(token_count=token_count, layer=self.location)
+            merge_params: Optional[MergeParams] = get_merge_params(token_count=token_count, layer=self.location)
+            if merge_params is not None:
+                # Apply ToMe here
+                k_heads_extracted: Tensor = rearrange(k, 'b n (h d) -> b n h d', h=h)
+                k_mean = k_heads_extracted.mean(-2)
+                del k_heads_extracted
 
-            # Apply ToMe here
-            k_heads_extracted: Tensor = rearrange(k, 'b n (h d) -> b n h d', h=h)
-            k_mean = k_heads_extracted.mean(-2)
-            del k_heads_extracted
-
-            match merge_params:
-                case BipartiteParams(r):
-                    merge, _ = bipartite_soft_matching(
-                        k_mean,
-                        r,
-                        self._tome_info.class_token,
-                        self._tome_info.distill_token,
+                match merge_params:
+                    case BipartiteParams(r):
+                        merge, _ = bipartite_soft_matching(
+                            k_mean,
+                            r,
+                            self._tome_info.class_token,
+                            self._tome_info.distill_token,
+                        )
+                    case RandomBipartiteParams(r):
+                        merge, _ = random_bipartite_soft_matching(
+                            k_mean,
+                            r
+                        )
+                    case KthBipartiteParams(k_):
+                        merge, _ = kth_bipartite_soft_matching(
+                            k_mean,
+                            k_
+                        )
+                    case _:
+                        raise TypeError(f"That ({merge_params}) ain't no MergeParams I ever heard of")
+                
+                del k_mean
+                if self._tome_info.trace_source:
+                    self._tome_info.source = merge_source(
+                        merge, tome_source_dims, self._tome_info.source, device=tome_source_device
                     )
-                case RandomBipartiteParams(r):
-                    merge, _ = random_bipartite_soft_matching(
-                        k_mean,
-                        r
-                    )
-                case KthBipartiteParams(k_):
-                    merge, _ = kth_bipartite_soft_matching(
-                        k_mean,
-                        k_
-                    )
-                case _:
-                    raise TypeError(f"That ({merge_params}) ain't no MergeParams I ever heard of")
-            
-            del k_mean
-            if self._tome_info.trace_source:
-                self._tome_info.source = merge_source(
-                    merge, tome_source_dims, self._tome_info.source, device=tome_source_device
-                )
-            k = merge(k, mode='mean')
-            v = merge(v, mode='mean')
-            del merge
+                k = merge(k, mode='mean')
+                v = merge(v, mode='mean')
+                del merge
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
