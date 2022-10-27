@@ -1,12 +1,17 @@
+from dataclasses import dataclass
 from inspect import isfunction
 import math
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum
+from torch import nn, einsum, Tensor
 from einops import rearrange, repeat
+from typing import Optional
 
 from ldm.modules.diffusionmodules.util import checkpoint
-
+from ldm.modules.tome.layer import SpatialTransformerLayerLocation, SpatialTransformerSelfAttnLocation, UNetLayerLocation
+from ldm.modules.tome.merge import SourceDims, bipartite_soft_matching, kth_bipartite_soft_matching, merge_source, merge_wavg, random_bipartite_soft_matching
+from ldm.modules.tome.params import BipartiteParams, GetMergeParams, KthBipartiteParams, MergeParams, RandomBipartiteParams
+from ldm.modules.tome.tome_info import ToMeInfo
 
 def exists(val):
     return val is not None
@@ -148,10 +153,13 @@ class SpatialSelfAttention(nn.Module):
 
         return x+h_
 
-
 class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+    _tome_info: ToMeInfo
+    location: SpatialTransformerSelfAttnLocation
+    def __init__(self, query_dim, _tome_info: ToMeInfo, location: SpatialTransformerSelfAttnLocation, context_dim=None, heads=8, dim_head=64, dropout=0.):
         super().__init__()
+        self._tome_info = _tome_info
+        self.location = location
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
@@ -167,15 +175,55 @@ class CrossAttention(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x, context=None, mask=None):
+    def forward(self, x, context=None, mask=None, get_merge_params: Optional[GetMergeParams]=None) -> Tensor:
+        is_self_attention = context is None
         h = self.heads
 
         q = self.to_q(x)
-        context = default(context, x)
+        context: Tensor = default(context, x)
         del x
+        batch_size, token_count, _ = context.shape
+        tome_source_dims = SourceDims(batch_size, token_count)
+        tome_source_device = context.device
         k = self.to_k(context)
         v = self.to_v(context)
         del context
+
+        if is_self_attention and callable(get_merge_params):
+            merge_params: Optional[MergeParams] = get_merge_params(token_count=token_count, layer=self.location)
+            if merge_params is not None:
+                # Apply ToMe here
+                k_heads_extracted: Tensor = rearrange(k, 'b n (h d) -> b n h d', h=h)
+                k_mean = k_heads_extracted.mean(-2)
+                del k_heads_extracted
+
+                match merge_params:
+                    case BipartiteParams(r):
+                        merge, _ = bipartite_soft_matching(
+                            k_mean,
+                            r
+                        )
+                    case RandomBipartiteParams(r):
+                        merge, _ = random_bipartite_soft_matching(
+                            k_mean,
+                            r
+                        )
+                    case KthBipartiteParams(k_):
+                        merge, _ = kth_bipartite_soft_matching(
+                            k_mean,
+                            k_
+                        )
+                    case _:
+                        raise TypeError(f"That ({merge_params}) ain't no MergeParams I ever heard of")
+                
+                del k_mean
+                if self._tome_info.trace_source:
+                    self._tome_info.source = merge_source(
+                        merge, tome_source_dims, self._tome_info.source, device=tome_source_device
+                    )
+                k = merge(k, mode='mean')
+                v = merge(v, mode='mean')
+                del merge
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
@@ -196,34 +244,38 @@ class CrossAttention(nn.Module):
         out = einsum('b i j, b j d -> b i d', attn, v)
         del attn, v
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        del h
         return self.to_out(out)
 
 
 class BasicTransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
+    _tome_info: ToMeInfo
+    location: SpatialTransformerSelfAttnLocation
+    def __init__(self, dim, n_heads, d_head, _tome_info: ToMeInfo, location: SpatialTransformerSelfAttnLocation, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
         super().__init__()
-        self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
+        self.location=location
+        self._tome_info=_tome_info
+        self.location=location
+        self.attn1 = CrossAttention(query_dim=dim, _tome_info=_tome_info, location=location, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
-        self.attn2 = CrossAttention(query_dim=dim, context_dim=context_dim,
+        self.attn2 = CrossAttention(query_dim=dim, _tome_info=_tome_info, location=location, context_dim=context_dim,
                                     heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
 
-    def forward(self, x, context=None):
-        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+    def forward(self, x, context=None, get_merge_params: Optional[GetMergeParams]=None):
+        return checkpoint(self._forward, (x, context, get_merge_params), self.parameters(), self.checkpoint)
 
-    def _forward(self, x, context=None):
+    def _forward(self, x, context=None, get_merge_params: Optional[GetMergeParams]=None):
         x = x.contiguous() if x.device.type == 'mps' else x
-        x = self.attn1(self.norm1(x)) + x
+        x = self.attn1(self.norm1(x), get_merge_params=get_merge_params) + x
         x = self.attn2(self.norm2(x), context=context) + x
         x = self.ff(self.norm3(x)) + x
         return x
 
-
 class SpatialTransformer(nn.Module):
+    _tome_info: ToMeInfo
     """
     Transformer block for image-like data.
     First, project the input (aka embedding)
@@ -231,11 +283,12 @@ class SpatialTransformer(nn.Module):
     Then apply standard transformer action.
     Finally, reshape to image
     """
-    def __init__(self, in_channels, n_heads, d_head,
+    def __init__(self, in_channels, n_heads, d_head, _tome_info: ToMeInfo, unet_location: UNetLayerLocation,
                  depth=1, dropout=0., context_dim=None):
         super().__init__()
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
+        self._tome_info = _tome_info
         self.norm = Normalize(in_channels)
 
         self.proj_in = nn.Conv2d(in_channels,
@@ -243,9 +296,13 @@ class SpatialTransformer(nn.Module):
                                  kernel_size=1,
                                  stride=1,
                                  padding=0)
-
         self.transformer_blocks = nn.ModuleList(
-            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim)
+            [BasicTransformerBlock(inner_dim, n_heads, d_head, _tome_info=self._tome_info, location=SpatialTransformerSelfAttnLocation(
+                unet_location=unet_location,
+                spatial_transformer_location=SpatialTransformerLayerLocation(
+                    spatial_transformer_block_depth=d
+                )
+            ), dropout=dropout, context_dim=context_dim)
                 for d in range(depth)]
         )
 
@@ -255,15 +312,16 @@ class SpatialTransformer(nn.Module):
                                               stride=1,
                                               padding=0))
 
-    def forward(self, x, context=None):
+    def forward(self, x, context=None, get_merge_params: Optional[GetMergeParams]=None):
         # note: if no context is given, cross-attention defaults to self-attention
         b, c, h, w = x.shape
         x_in = x
         x = self.norm(x)
         x = self.proj_in(x)
         x = rearrange(x, 'b c h w -> b (h w) c')
+
         for block in self.transformer_blocks:
-            x = block(x, context=context)
+            x = block(x, context=context, get_merge_params=get_merge_params)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
         x = self.proj_out(x)
         return x + x_in

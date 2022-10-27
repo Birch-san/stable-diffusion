@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from functools import partial
 import math
-from typing import Iterable
+from typing import Iterable, Optional, Protocol
 
 import numpy as np
 import torch as th
@@ -18,6 +18,10 @@ from ldm.modules.diffusionmodules.util import (
     timestep_embedding,
 )
 from ldm.modules.attention import SpatialTransformer
+from ldm.modules.tome.layer import UNetLayerLocation, UNetSection
+from ldm.modules.tome.params import GetMergeParams, KthBipartiteParams
+from ldm.modules.tome.tome_info import ToMeInfo
+from torch import Tensor
 
 
 # dummy replace
@@ -77,12 +81,12 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None):
+    def forward(self, x, emb, context=None, get_merge_params: Optional[GetMergeParams]=None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer):
-                x = layer(x, context)
+                x = layer(x, context, get_merge_params=get_merge_params)
             else:
                 x = layer(x)
         return x
@@ -411,6 +415,7 @@ class QKVAttention(nn.Module):
 
 
 class UNetModel(nn.Module):
+    _tome_info: ToMeInfo
     """
     The full UNet model with attention and timestep embedding.
     :param in_channels: channels in the input Tensor.
@@ -486,6 +491,11 @@ class UNetModel(nn.Module):
         if num_head_channels == -1:
             assert num_heads != -1, 'Either num_heads or num_head_channels has to be set'
 
+        self._tome_info = ToMeInfo(
+            source=None,
+            trace_source=False
+        )
+
         self.image_size = image_size
         self.in_channels = in_channels
         self.model_channels = model_channels
@@ -525,7 +535,7 @@ class UNetModel(nn.Module):
         ch = model_channels
         ds = 1
         for level, mult in enumerate(channel_mult):
-            for _ in range(num_res_blocks):
+            for i in range(num_res_blocks):
                 layers = [
                     ResBlock(
                         ch,
@@ -547,6 +557,11 @@ class UNetModel(nn.Module):
                     if legacy:
                         #num_heads = 1
                         dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
+                    location=UNetLayerLocation(
+                        section=UNetSection.Input,
+                        level=level,
+                        res_block_ix=i
+                    )
                     layers.append(
                         AttentionBlock(
                             ch,
@@ -555,7 +570,7 @@ class UNetModel(nn.Module):
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
                         ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, _tome_info=self._tome_info, unet_location=location, depth=transformer_depth, context_dim=context_dim
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -610,8 +625,12 @@ class UNetModel(nn.Module):
                 num_head_channels=dim_head,
                 use_new_attention_order=use_new_attention_order,
             ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
-                        ),
+                ch, num_heads, dim_head, _tome_info=self._tome_info, unet_location=UNetLayerLocation(
+                    section=UNetSection.Middle,
+                    level=level,
+                    res_block_ix=i
+                ), depth=transformer_depth, context_dim=context_dim
+            ),
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -648,6 +667,11 @@ class UNetModel(nn.Module):
                     if legacy:
                         #num_heads = 1
                         dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
+                    location=UNetLayerLocation(
+                        section=UNetSection.Output,
+                        level=level,
+                        res_block_ix=i
+                    )
                     layers.append(
                         AttentionBlock(
                             ch,
@@ -656,7 +680,7 @@ class UNetModel(nn.Module):
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
                         ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            ch, num_heads, dim_head, _tome_info=self._tome_info, unet_location=location, depth=transformer_depth, context_dim=context_dim
                         )
                     )
                 if level and i == num_res_blocks:
@@ -707,7 +731,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps=None, context=None, y=None,**kwargs):
+    def forward(self, x, timesteps=None, context=None, y=None, get_merge_params: Optional[GetMergeParams]=None, **kwargs):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
@@ -719,6 +743,8 @@ class UNetModel(nn.Module):
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
+        self._tome_info.source = None
+        
         hs = []
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
         emb = self.time_embed(t_emb)
@@ -729,12 +755,12 @@ class UNetModel(nn.Module):
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
-            h = module(h, emb, context)
+            h = module(h, emb, context, get_merge_params=get_merge_params)
             hs.append(h)
-        h = self.middle_block(h, emb, context)
+        h = self.middle_block(h, emb, context, get_merge_params=get_merge_params)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, context)
+            h = module(h, emb, context, get_merge_params=get_merge_params)
         h = h.type(x.dtype)
         if self.predict_codebook_ids:
             return self.id_predictor(h)
