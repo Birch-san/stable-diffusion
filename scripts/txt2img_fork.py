@@ -92,6 +92,7 @@ K_DIFF_SAMPLERS = { *KARRAS_SAMPLERS, *PRE_KARRAS_K_DIFF_SAMPLERS, *DPM_SOLVER_S
 NOT_K_DIFF_SAMPLERS = { 'ddim', 'plms' }
 VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
 
+MakeGetMergeParams: TypeAlias = Callable[[float], GetMergeParams]
 
 def make_get_merge_params(sigma: float) -> GetMergeParams:
     def get_merge_params(
@@ -102,6 +103,11 @@ def make_get_merge_params(sigma: float) -> GetMergeParams:
     return get_merge_params
 
 class KCFGDenoiser(BaseModelWrapper):
+    make_get_merge_params: Optional[MakeGetMergeParams]
+    def __init__(self, inner_model: DiffusionModel, make_get_merge_params: Optional[MakeGetMergeParams]=None):
+        super().__init__(inner_model)
+        self.make_get_merge_params=make_get_merge_params
+
     def forward(
         self,
         x: Tensor,
@@ -123,7 +129,7 @@ class KCFGDenoiser(BaseModelWrapper):
         x_in = cat_self_with_repeat_interleaved(t=x, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
         del x
         sigma_in = cat_self_with_repeat_interleaved(t=sigma, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
-        get_merge_params: GetMergeParams = make_get_merge_params(sigma.item())
+        get_merge_params: Optional[GetMergeParams] = self.make_get_merge_params(sigma.item()) if callable(self.make_get_merge_params) else None
         del sigma
         uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in, get_merge_params=get_merge_params).split([uncond_count, cond_count])
         del x_in, sigma_in, cond_in
@@ -749,6 +755,12 @@ def main():
         default=None,
         help="Path to a pre-trained embedding manager checkpoint"
     )
+    parser.add_argument(
+        "--use_tome",
+        action='store_true',
+        # I don't attempt to expose finer command-line control of the ToMe merging, because you could want a schedule that's hard to express through command-line options. modify the make_get_merge_params function instead.
+        help="whether to use ToMe (https://github.com/facebookresearch/ToMe) to merge tokens, reducing the size of the matrix multiplication during in self-attention. saves memory and could improve performance, at the expense of reducing accuracy.",
+    )
     opt = parser.parse_args()
 
     if opt.laion400m:
@@ -769,7 +781,7 @@ def main():
 
     if opt.sampler in K_DIFF_SAMPLERS:
         model_k_wrapped = CompVisDenoiserWrapper(model, quantize=True)
-        model_k_guidance = KCFGDenoiser(model_k_wrapped)
+        model_k_guidance = KCFGDenoiser(model_k_wrapped, make_get_merge_params=make_get_merge_params if opt.use_tome else None)
     elif opt.sampler in NOT_K_DIFF_SAMPLERS:
         if opt.sampler == 'plms':
             sampler = PLMSSampler(model)
