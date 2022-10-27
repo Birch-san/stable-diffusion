@@ -201,9 +201,7 @@ class CrossAttention(nn.Module):
                     case BipartiteParams(r):
                         merge, _ = bipartite_soft_matching(
                             k_mean,
-                            r,
-                            self._tome_info.class_token,
-                            self._tome_info.distill_token,
+                            r
                         )
                     case RandomBipartiteParams(r):
                         merge, _ = random_bipartite_soft_matching(

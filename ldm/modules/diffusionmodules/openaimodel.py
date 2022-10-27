@@ -492,12 +492,8 @@ class UNetModel(nn.Module):
             assert num_heads != -1, 'Either num_heads or num_head_channels has to be set'
 
         self._tome_info = ToMeInfo(
-            size=None,
             source=None,
-            trace_source=False,
-            prop_attn=True,
-            class_token=False,
-            distill_token=False
+            trace_source=False
         )
 
         self.image_size = image_size
@@ -747,7 +743,6 @@ class UNetModel(nn.Module):
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
-        self._tome_info.size = None
         self._tome_info.source = None
         
         hs = []
