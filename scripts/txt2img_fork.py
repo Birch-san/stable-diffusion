@@ -99,7 +99,7 @@ def make_get_merge_params(sigma: float) -> GetMergeParams:
         token_count: int,
         layer: ToMeLayer
     ) -> Optional[MergeParams]:
-        if token_count >= 1024:
+        if token_count >= 2048:
             return KthBipartiteParams(k=4)
         return None
     return get_merge_params
