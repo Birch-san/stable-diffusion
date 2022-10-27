@@ -492,7 +492,7 @@ class UNetModel(nn.Module):
             assert num_heads != -1, 'Either num_heads or num_head_channels has to be set'
         
         # TODO: expose r somewhere the user can fiddle with it
-        self.r = 1024
+        self.r = 2048
         self._tome_info = ToMeInfo(
             # each SpatialTransformer we construct will increment `candidates`, telling us on how many layers _tome will be applied
             # in practice: 16
@@ -502,8 +502,8 @@ class UNetModel(nn.Module):
             source=None,
             trace_source=False,
             prop_attn=True,
-            class_token=False,#model.cls_token is not None,
-            distill_token=False,
+            class_token=True,#model.cls_token is not None,
+            distill_token=True,
         )
 
         self.image_size = image_size
