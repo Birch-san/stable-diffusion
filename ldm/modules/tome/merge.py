@@ -105,132 +105,25 @@ def bipartite_soft_matching(
 
     return merge, unmerge
 
-
-def kth_bipartite_soft_matching(
-    metric: torch.Tensor, k: int
-) -> Tuple[Callable, Callable]:
-    """
-    Applies ToMe with the two sets as (every kth element, the rest).
-    If n is the number of tokens, resulting number of tokens will be n // z.
-
-    Input size is [batch, tokens, channels].
-    z indicates the stride for the first set.
-    z = 2 is equivalent to regular bipartite_soft_matching with r = 0.5 * N
-    """
-    if k <= 1:
-        return do_nothing, do_nothing
-
-    def split(x):
-        t_rnd = (x.shape[1] // k) * k
-        x = x[:, :t_rnd, :].view(x.shape[0], -1, k, x.shape[2])
-        a, b = (
-            x[:, :, : (k - 1), :].contiguous().view(x.shape[0], -1, x.shape[-1]),
-            x[:, :, (k - 1), :],
-        )
-        return a, b
-
-    with torch.no_grad():
-        metric = metric / metric.norm(dim=-1, keepdim=True)
-        a, b = split(metric)
-        r = a.shape[1]
-        scores = a @ b.transpose(-1, -2)
-
-        _, dst_idx = scores.max(dim=-1)
-        dst_idx = dst_idx[..., None]
-
-    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
-        src, dst = split(x)
-        n, _, c = src.shape
-        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
-
-        return dst
-
-    def unmerge(x: torch.Tensor) -> torch.Tensor:
-        n, _, c = x.shape
-        dst = x
-
-        src = dst.gather(dim=-2, index=dst_idx.expand(n, r, c)).to(x.dtype)
-
-        src = src.view(n, -1, (k - 1), c)
-        dst = dst.view(n, -1, 1, c)
-
-        out = torch.cat([src, dst], dim=-2)
-        out = out.contiguous().view(n, -1, c)
-
-        return out
-
-    return merge, unmerge
-
-
-def random_bipartite_soft_matching(
-    metric: torch.Tensor, r: int
-) -> Tuple[Callable, Callable]:
-    """
-    Applies ToMe with the two sets as (r chosen randomly, the rest).
-    Input size is [batch, tokens, channels].
-
-    This will reduce the number of tokens by r.
-    """
-    if r <= 0:
-        return do_nothing, do_nothing
-
-    with torch.no_grad():
-        B, N, _ = metric.shape
-        rand_idx = torch.rand(B, N, 1, device=metric.device).argsort(dim=1)
-
-        a_idx = rand_idx[:, :r, :]
-        b_idx = rand_idx[:, r:, :]
-
-        def split(x):
-            C = x.shape[-1]
-            a = x.gather(dim=1, index=a_idx.expand(B, r, C))
-            b = x.gather(dim=1, index=b_idx.expand(B, N - r, C))
-            return a, b
-
-        metric = metric / metric.norm(dim=-1, keepdim=True)
-        a, b = split(metric)
-        scores = a @ b.transpose(-1, -2)
-
-        _, dst_idx = scores.max(dim=-1)
-        dst_idx = dst_idx[..., None]
-
-    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
-        src, dst = split(x)
-        C = src.shape[-1]
-        dst = dst.scatter_reduce(-2, dst_idx.expand(B, r, C), src, reduce=mode)
-
-        return dst
-
-    def unmerge(x: torch.Tensor) -> torch.Tensor:
-        C = x.shape[-1]
-        dst = x
-        src = dst.gather(dim=-2, index=dst_idx.expand(B, r, C))
-
-        out = torch.zeros(B, N, C, device=x.device, dtype=x.dtype)
-
-        out.scatter_(dim=-2, index=a_idx.expand(B, r, C), src=src)
-        out.scatter_(dim=-2, index=b_idx.expand(B, N - r, C), src=dst)
-
-        return out
-
-    return merge, unmerge
-
-
 def merge_wavg(
-    merge: Callable, x: torch.Tensor, size: torch.Tensor = None
+    merge: Callable, k: torch.Tensor, v: torch.Tensor, size: torch.Tensor = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Applies the merge function by taking a weighted average based on token size.
     Returns the merged tensor and the new token sizes.
     """
     if size is None:
-        size = torch.ones_like(x[..., 0, None])
+        size = torch.ones_like(k[..., 0, None])
 
-    x = merge(x * size, mode="sum")
+    k = merge(k * size, mode="sum")
+    v = merge(v * size, mode="sum")
+
     size = merge(size, mode="sum")
 
-    x = x / size
-    return x, size
+    k = k / size
+    v = v / size
+
+    return k, v, size
 
 
 def merge_source(
