@@ -23,6 +23,7 @@ from ldm.models.diffusion.ddpm import LatentDiffusion
 import abc
 from dataclasses import dataclass
 from enum import Enum
+from math import log2
 from ldm.modules.tome.layer import ToMeLayer
 from ldm.modules.tome.params import GetMergeParams, KthBipartiteParams, MergeParams
 
@@ -94,13 +95,15 @@ VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
 
 MakeGetMergeParams: TypeAlias = Callable[[float], GetMergeParams]
 
+biggest_matmul = 1024
 def make_get_merge_params(sigma: float) -> GetMergeParams:
     def get_merge_params(
         token_count: int,
         layer: ToMeLayer
     ) -> Optional[MergeParams]:
-        if token_count >= 2048:
-            return KthBipartiteParams(k=4)
+        if token_count > biggest_matmul:
+            k=int(token_count/biggest_matmul)
+            return KthBipartiteParams(k=k)
         return None
     return get_merge_params
 
