@@ -1,8 +1,10 @@
+from __future__ import annotations
 from inspect import isfunction
 import math
 import torch
 import torch.nn.functional as F
 from torch.nn import MultiheadAttention
+from torch.nn.modules.module import _IncompatibleKeys
 from torch import nn, einsum, Tensor
 from einops import rearrange, repeat
 
@@ -150,20 +152,14 @@ class SpatialSelfAttention(nn.Module):
         return x+h_
 
     
-class CrossAttention(MultiheadAttention):
+class CrossAttention(nn.Module):
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+        super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
-        super().__init__(
-            embed_dim=inner_dim,
-            # kdim=context_dim,
-            # vdim=context_dim,
-            bias=False,
-            dropout=dropout,
-            batch_first=True,
-            num_heads=heads,
-        )
+        self.scale = dim_head ** -0.5
+        self.heads = heads
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
@@ -173,8 +169,10 @@ class CrossAttention(MultiheadAttention):
             nn.Linear(inner_dim, query_dim),
             nn.Dropout(dropout)
         )
-    
+
     def forward(self, x, context=None, mask=None):
+        h = self.heads
+
         q = self.to_q(x)
         context = default(context, x)
         del x
@@ -182,20 +180,71 @@ class CrossAttention(MultiheadAttention):
         v = self.to_v(context)
         del context
 
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        del q, k
+
+        if exists(mask):
+            mask = rearrange(mask, 'b ... -> b (...)')
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value)
+            del mask
+
+        # attention, what we cannot get enough of
+        attn = sim.softmax(dim=-1)
+        del sim
+
+        out = einsum('b i j, b j d -> b i d', attn, v)
+        del attn, v
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        del h
+        return self.to_out(out)
+
+class SelfAttention(MultiheadAttention):
+    def __init__(self, query_dim, heads=8, dim_head=64, dropout=0.):
+        inner_dim = dim_head * heads
+
+        super().__init__(
+            embed_dim=inner_dim,
+            # we don't actually use bias, but torch._native_multi_head_attention explodes if you pass None to it
+            # so this is a way to get an empty bias tensor created
+            bias=True,
+            dropout=dropout,
+            batch_first=True,
+            num_heads=heads,
+        )
+
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(query_dim, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, query_dim),
+            nn.Dropout(dropout)
+        )
+
+        super().register_load_state_dict_post_hook(self.init_multihead)
+    
+    def init_multihead(self, module: SelfAttention, incompatible_keys: _IncompatibleKeys) -> None:
+        self.get_parameter('in_proj_weight').data = torch.cat([self.to_q.weight, self.to_k.weight, self.to_v.weight])
+        self.out_proj.weight = self.to_out[0].weight
+        self.out_proj.bias = self.to_out[0].bias
+    
+    def forward(self, x: Tensor) -> Tensor:
         out, _ = super().forward(
-            query=q,
-            key=k,
-            value=v,
+            query=x,
+            key=x,
+            value=x,
             need_weights=False,
         )
-        # make contiguous to help MPS backend on pytorch 1.12.1 (keep happy the layernorm downstream of us)
-        return out.contiguous()
-
+        return out
 
 class BasicTransformerBlock(nn.Module):
     def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
         super().__init__()
-        self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
+        self.attn1 = SelfAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
         self.attn2 = CrossAttention(query_dim=dim, context_dim=context_dim,
                                     heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
