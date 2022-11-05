@@ -31,7 +31,7 @@ from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 
-from k_diffusion.sampling import sample_lms, sample_dpm_2, sample_dpm_2_ancestral, sample_euler, sample_euler_ancestral, sample_heun, sample_dpm_fast, sample_dpm_adaptive, get_sigmas_karras, append_zero
+from k_diffusion.sampling import sample_lms, sample_dpm_2, sample_dpm_2_ancestral, sample_euler, sample_euler_ancestral, sample_heun, sample_dpm_fast, sample_dpm_adaptive, sample_dpmpp_2m, sample_dpmpp_2s_ancestral, get_sigmas_karras, append_zero
 from k_diffusion.external import CompVisDenoiser
 
 def get_device():
@@ -89,7 +89,8 @@ class CompVisDenoiserWrapper(CompVisDenoiser, DiffusionModelMixin):
 PRE_KARRAS_K_DIFF_SAMPLERS = { 'k_lms', 'dpm2_ancestral', 'euler_ancestral' }
 KARRAS_SAMPLERS = { 'heun', 'euler', 'dpm2' }
 DPM_SOLVER_SAMPLERS = { 'dpm_fast', 'dpm_adaptive' }
-K_DIFF_SAMPLERS = { *KARRAS_SAMPLERS, *PRE_KARRAS_K_DIFF_SAMPLERS, *DPM_SOLVER_SAMPLERS }
+DPM_SOLVERPP_SAMPLERS = { 'dpmpp_2m', 'dpmpp_2s_a' }
+K_DIFF_SAMPLERS = { *KARRAS_SAMPLERS, *PRE_KARRAS_K_DIFF_SAMPLERS, *DPM_SOLVER_SAMPLERS, *DPM_SOLVERPP_SAMPLERS }
 NOT_K_DIFF_SAMPLERS = { 'ddim', 'plms' }
 VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
 
@@ -1035,6 +1036,10 @@ def main():
                                     sampling_fn = sample_dpm_2
                                 case 'dpm2_ancestral':
                                     sampling_fn = sample_dpm_2_ancestral
+                                case 'dpmpp_2m':
+                                    sampling_fn = sample_dpmpp_2m
+                                case 'dpmpp_2s_a':
+                                    sampling_fn = sample_dpmpp_2s_ancestral
                                 case 'heun':
                                     sampling_fn = sample_heun
                                 case 'euler':
