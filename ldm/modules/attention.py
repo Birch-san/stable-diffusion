@@ -3,7 +3,8 @@ from inspect import isfunction
 import math
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum, Tensor
+from torch import nn, Tensor, empty, baddbmm, bmm
+from torch.nn import Parameter
 from einops import rearrange, repeat
 from typing import Optional
 
@@ -175,6 +176,8 @@ class CrossAttention(nn.Module):
             nn.Dropout(dropout)
         )
 
+        self.empty = Parameter(empty((1, 1, 1)), requires_grad=False)
+
     def forward(self, x, context=None, mask=None, get_merge_params: Optional[GetMergeParams]=None) -> Tensor:
         is_self_attention = context is None
         h = self.heads
@@ -227,7 +230,7 @@ class CrossAttention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        sim = baddbmm(self.empty, q, k.transpose(1, 2), alpha=self.scale, beta=0)
         del q, k
 
         if exists(mask):
@@ -241,7 +244,7 @@ class CrossAttention(nn.Module):
         attn = sim.softmax(dim=-1)
         del sim
 
-        out = einsum('b i j, b j d -> b i d', attn, v)
+        out = bmm(attn, v)
         del attn, v
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(out)
