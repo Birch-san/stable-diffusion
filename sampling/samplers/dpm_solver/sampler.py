@@ -9,9 +9,39 @@ from .dpm_solver import NoiseScheduleVP, model_wrapper, DPM_Solver
 # https://github.com/LuChengTHU/dpm-solver/blob/414c74f62fb189723461aadc91dc6527301e1dbe/LICENSE
 
 class DPMSolverSampler(object):
-    def __init__(self, model, **kwargs):
+    predict_x0: bool
+    thresholding: bool
+    max_val: float
+    threshold_pct: float
+    def __init__(
+        self,
+        model,
+        predict_x0=False,
+        thresholding=False,
+        max_val=1.,
+        threshold_pct=.995,
+        **kwargs
+    ):
+        """
+        We support both the noise prediction model ("predicting epsilon") and the data prediction model ("predicting x0").
+        If `predict_x0` is False, we use the solver for the noise prediction model (DPM-Solver).
+        If `predict_x0` is True, we use the solver for the data prediction model (DPM-Solver++).
+            In such case, we further support the "dynamic thresholding" in [1] when `thresholding` is True.
+            The "dynamic thresholding" can greatly improve the sample quality for pixel-space DPMs with large guidance scales.
+        
+        Args:
+            model
+            predict_x0: A `bool`. If true, use the data prediction model; else, use the noise prediction model.
+            thresholding: A `bool`. Valid when `predict_x0` is True. Whether to use the "dynamic thresholding" in [1].
+            max_val: A `float`. Valid when both `predict_x0` and `thresholding` are True. The max value for thresholding.
+            threshold_pct: A `float`. Valid when both `predict_x0` and `thresholding` are True. The percentile for thresholding.
+        """
         super().__init__()
         self.model = model
+        self.predict_x0=predict_x0
+        self.thresholding=thresholding
+        self.max_val=max_val
+        self.threshold_pct=threshold_pct
         to_torch = lambda x: x.detach().clone().float().to(model.device)
         self.register_buffer('alphas_cumprod', to_torch(model.alphas_cumprod))
 
@@ -81,7 +111,14 @@ class DPMSolverSampler(object):
             guidance_scale=unconditional_guidance_scale,
         )
 
-        dpm_solver = DPM_Solver(model_fn, ns, predict_x0=True, thresholding=False)
+        dpm_solver = DPM_Solver(
+            model_fn,
+            ns,
+            predict_x0=self.predict_x0,
+            thresholding=self.thresholding,
+            max_val=self.max_val,
+            threshold_pct=self.threshold_pct,
+        )
         x = dpm_solver.sample(img, steps=S, skip_type="time_uniform", method="multistep", order=2, lower_order_final=True)
 
         return x.to(device), None

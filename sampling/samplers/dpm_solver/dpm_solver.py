@@ -351,7 +351,19 @@ def model_wrapper(
 
 
 class DPM_Solver:
-    def __init__(self, model_fn, noise_schedule, predict_x0=False, thresholding=False, max_val=1.):
+    predict_x0: bool
+    thresholding: bool
+    max_val: float
+    threshold_pct: float
+    def __init__(
+        self,
+        model_fn,
+        noise_schedule,
+        predict_x0=False,
+        thresholding=False,
+        max_val=1.,
+        threshold_pct=0.995,
+    ):
         """Construct a DPM-Solver. 
 
         We support both the noise prediction model ("predicting epsilon") and the data prediction model ("predicting x0").
@@ -370,6 +382,7 @@ class DPM_Solver:
             predict_x0: A `bool`. If true, use the data prediction model; else, use the noise prediction model.
             thresholding: A `bool`. Valid when `predict_x0` is True. Whether to use the "dynamic thresholding" in [1].
             max_val: A `float`. Valid when both `predict_x0` and `thresholding` are True. The max value for thresholding.
+            threshold_pct: A `float`. Valid when both `predict_x0` and `thresholding` are True. The percentile for thresholding.
         
         [1] Chitwan Saharia, William Chan, Saurabh Saxena, Lala Li, Jay Whang, Emily Denton, Seyed Kamyar Seyed Ghasemipour, Burcu Karagol Ayan, S Sara Mahdavi, Rapha Gontijo Lopes, et al. Photorealistic text-to-image diffusion models with deep language understanding. arXiv preprint arXiv:2205.11487, 2022b.
         """
@@ -378,6 +391,7 @@ class DPM_Solver:
         self.predict_x0 = predict_x0
         self.thresholding = thresholding
         self.max_val = max_val
+        self.threshold_pct = threshold_pct
 
     def noise_prediction_fn(self, x, t):
         """
@@ -394,7 +408,7 @@ class DPM_Solver:
         alpha_t, sigma_t = self.noise_schedule.marginal_alpha(t), self.noise_schedule.marginal_std(t)
         x0 = (x - expand_dims(sigma_t, dims) * noise) / expand_dims(alpha_t, dims)
         if self.thresholding:
-            p = 0.995   # A hyperparameter in the paper of "Imagen" [1].
+            p = self.threshold_pct   # A hyperparameter in the paper of "Imagen" [1].
             s = torch.quantile(torch.abs(x0).reshape((x0.shape[0], -1)), p, dim=1)
             s = expand_dims(torch.maximum(s, self.max_val * torch.ones_like(s).to(s.device)), dims)
             x0 = torch.clamp(x0, -s, s) / s
