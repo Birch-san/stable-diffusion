@@ -63,7 +63,9 @@ class DPMSolverSampler(object):
 
         device = self.model.betas.device
         if x_T is None:
-            img = torch.randn(size, device=device)
+            # https://github.com/CompVis/stable-diffusion/issues/25#issuecomment-1229706811
+            # MPS random is not currently deterministic w.r.t seed, so compute randn() on-CPU
+            img = torch.randn(size, device='cpu' if device.type == 'mps' else device).to(device)
         else:
             img = x_T
 
