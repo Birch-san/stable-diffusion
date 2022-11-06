@@ -1044,6 +1044,26 @@ def main():
                                     unconditional_guidance_scale=opt.scale,
                                     unconditional_conditioning=uc,
                                 )
+                        elif opt.sampler in DPM_SOLVER_OFFICIAL_SAMPLERS:
+                            if opt.karras_noise:
+                                # it might be using Karras under-the-hood anyway though
+                                print(f"[WARN] You have requested --karras_noise, but Karras et al noise schedule is not implemented for {opt.sampler} sampler. Implemented only for {K_DIFF_SAMPLERS}. Using default noise schedule.")
+                            # currently an identical interface to PLMS/DDIM samplers, but duplicating the code so we have freedom to diverge
+                            samples, _ = dpm_sampler.sample(
+                                S=opt.steps,
+                                conditioning=c,
+                                batch_size=opt.n_samples,
+                                shape=shape,
+                                verbose=False,
+                                unconditional_guidance_scale=opt.scale,
+                                unconditional_conditioning=uc,
+                                eta=opt.ddim_eta,
+                                x_T=start_code
+                            )
+                            # DPM-Solver sampler doesn't tell us what sigmas were used
+                            # but it's probably possible to get this information
+                            sigmas = None
+                            sigmas_quantized = None
                         elif opt.sampler in K_DIFF_SAMPLERS:
                             match opt.sampler:
                                 case 'dpm_fast':
