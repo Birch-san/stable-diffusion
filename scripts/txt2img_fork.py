@@ -33,6 +33,7 @@ from ldm.models.diffusion.plms import PLMSSampler
 
 from k_diffusion.sampling import sample_lms, sample_dpm_2, sample_dpm_2_ancestral, sample_euler, sample_euler_ancestral, sample_heun, sample_dpm_fast, sample_dpm_adaptive, sample_dpmpp_2m, sample_dpmpp_2s_ancestral, get_sigmas_karras, append_zero
 from k_diffusion.external import CompVisDenoiser
+from sampling.samplers.dpm_solver.sampler import DPMSolverSampler
 
 def get_device():
     if(torch.cuda.is_available()):
@@ -91,8 +92,9 @@ KARRAS_SAMPLERS = { 'heun', 'euler', 'dpm2' }
 DPM_SOLVER_SAMPLERS = { 'dpm_fast', 'dpm_adaptive' }
 DPM_SOLVERPP_SAMPLERS = { 'dpmpp_2m', 'dpmpp_2s_a' }
 K_DIFF_SAMPLERS = { *KARRAS_SAMPLERS, *PRE_KARRAS_K_DIFF_SAMPLERS, *DPM_SOLVER_SAMPLERS, *DPM_SOLVERPP_SAMPLERS }
-NOT_K_DIFF_SAMPLERS = { 'ddim', 'plms' }
-VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
+BUILTIN_SAMPLERS = { 'ddim', 'plms' }
+DPM_SOLVER_OFFICIAL_SAMPLERS = { 'odpm', 'odpmpp' }
+VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *BUILTIN_SAMPLERS, *DPM_SOLVER_OFFICIAL_SAMPLERS }
 
 MakeGetMergeParams: TypeAlias = Callable[[float], GetMergeParams]
 
@@ -788,7 +790,9 @@ def main():
     if opt.sampler in K_DIFF_SAMPLERS:
         model_k_wrapped = CompVisDenoiserWrapper(model, quantize=True)
         model_k_guidance = KCFGDenoiser(model_k_wrapped, make_get_merge_params=make_get_merge_params if opt.use_tome else None)
-    elif opt.sampler in NOT_K_DIFF_SAMPLERS:
+    elif opt.sampler in DPM_SOLVER_OFFICIAL_SAMPLERS:
+        dpm_sampler = DPMSolverSampler(model, predict_x0=opt.sampler == 'odpmpp')
+    elif opt.sampler in BUILTIN_SAMPLERS:
         if opt.sampler == 'plms':
             sampler = PLMSSampler(model)
         else:
@@ -999,7 +1003,7 @@ def main():
                                 case _:
                                     raise TypeError(f"That ({batch_spec}) ain't no BatchSpec I ever heard of")
 
-                        if opt.sampler in NOT_K_DIFF_SAMPLERS:
+                        if opt.sampler in BUILTIN_SAMPLERS:
                             if opt.karras_noise:
                                 print(f"[WARN] You have requested --karras_noise, but Karras et al noise schedule is not implemented for {opt.sampler} sampler. Implemented only for {K_DIFF_SAMPLERS}. Using default noise schedule from DDIM.")
                             if init_latent is None:
@@ -1026,6 +1030,26 @@ def main():
                                     unconditional_guidance_scale=opt.scale,
                                     unconditional_conditioning=uc,
                                 )
+                        elif opt.sampler in DPM_SOLVER_OFFICIAL_SAMPLERS:
+                            if opt.karras_noise:
+                                # it might be using Karras under-the-hood anyway though
+                                print(f"[WARN] You have requested --karras_noise, but Karras et al noise schedule is not implemented for {opt.sampler} sampler. Implemented only for {K_DIFF_SAMPLERS}. Using default noise schedule.")
+                            # currently an identical interface to PLMS/DDIM samplers, but duplicating the code so we have freedom to diverge
+                            samples, _ = dpm_sampler.sample(
+                                S=opt.steps,
+                                conditioning=c,
+                                batch_size=opt.n_samples,
+                                shape=shape,
+                                verbose=False,
+                                unconditional_guidance_scale=opt.scale,
+                                unconditional_conditioning=uc,
+                                eta=opt.ddim_eta,
+                                x_T=start_code
+                            )
+                            # DPM-Solver sampler doesn't tell us what sigmas were used
+                            # but it's probably possible to get this information
+                            sigmas = None
+                            sigmas_quantized = None
                         elif opt.sampler in K_DIFF_SAMPLERS:
                             match opt.sampler:
                                 case 'dpm_fast':
