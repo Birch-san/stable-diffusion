@@ -604,12 +604,6 @@ def main():
         default=0.9995,
     )
     parser.add_argument(
-        "--dynamic_thresholding_ceil",
-        type=float,
-        default=1.0,
-        help=f"max value for thresholding. 'odpmpp' sampler (official DPM-Solver++) only. corresponds to DPM_Solver#__init(max_val)."
-    )
-    parser.add_argument(
         "--laion400m",
         action='store_true',
         help="uses the LAION400M model",
@@ -797,15 +791,7 @@ def main():
         model_k_wrapped = CompVisDenoiserWrapper(model, quantize=True)
         model_k_guidance = KCFGDenoiser(model_k_wrapped, make_get_merge_params=make_get_merge_params if opt.use_tome else None)
     elif opt.sampler in DPM_SOLVER_OFFICIAL_SAMPLERS:
-        dpm_sampler = DPMSolverSampler(model,
-            predict_x0=opt.sampler == 'odpmpp',
-            # only used when sampler is odpmpp
-            thresholding=opt.dynamic_thresholding,
-            # only used when sampler is odpmpp and thresholding enabled
-            max_val=opt.dynamic_thresholding_ceil,
-            # only used when sampler is odpmpp and thresholding enabled
-            threshold_pct=opt.dynamic_thresholding_percentile,
-        )
+        dpm_sampler = DPMSolverSampler(model, predict_x0=opt.sampler == 'odpmpp')
     elif opt.sampler in BUILTIN_SAMPLERS:
         if opt.sampler == 'plms':
             sampler = PLMSSampler(model)

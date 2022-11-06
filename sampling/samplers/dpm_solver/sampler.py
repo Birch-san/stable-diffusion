@@ -11,16 +11,10 @@ from util.device import get_device_type
 
 class DPMSolverSampler(object):
     predict_x0: bool
-    thresholding: bool
-    max_val: float
-    threshold_pct: float
     def __init__(
         self,
         model,
         predict_x0=False,
-        thresholding=False,
-        max_val=1.,
-        threshold_pct=.995,
         **kwargs
     ):
         """
@@ -33,16 +27,10 @@ class DPMSolverSampler(object):
         Args:
             model
             predict_x0: A `bool`. If true, use the data prediction model; else, use the noise prediction model.
-            thresholding: A `bool`. Valid when `predict_x0` is True. Whether to use the "dynamic thresholding" in [1].
-            max_val: A `float`. Valid when both `predict_x0` and `thresholding` are True. The max value for thresholding.
-            threshold_pct: A `float`. Valid when both `predict_x0` and `thresholding` are True. The percentile for thresholding.
         """
         super().__init__()
         self.model = model
         self.predict_x0=predict_x0
-        self.thresholding=thresholding
-        self.max_val=max_val
-        self.threshold_pct=threshold_pct
         to_torch = lambda x: x.detach().clone().float().to(model.device)
         preferred_device = torch.device(get_device_type())
         self.register_buffer('alphas_cumprod', to_torch(model.alphas_cumprod), preferred_device)
@@ -113,14 +101,7 @@ class DPMSolverSampler(object):
             guidance_scale=unconditional_guidance_scale,
         )
 
-        dpm_solver = DPM_Solver(
-            model_fn,
-            ns,
-            predict_x0=self.predict_x0,
-            thresholding=self.thresholding,
-            max_val=self.max_val,
-            threshold_pct=self.threshold_pct,
-        )
+        dpm_solver = DPM_Solver(model_fn, ns, predict_x0=self.predict_x0)
         x = dpm_solver.sample(img, steps=S, skip_type="time_uniform", method="multistep", order=2, lower_order_final=True)
 
         return x.to(device), None
