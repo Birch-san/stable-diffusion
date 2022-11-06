@@ -3,6 +3,7 @@
 import torch
 
 from .dpm_solver import NoiseScheduleVP, model_wrapper, DPM_Solver
+from util.device import get_device_type
 
 # this file comes from Cheng Lu's dpm-solver repository, MIT-licensed.
 # https://github.com/LuChengTHU/dpm-solver/blob/414c74f62fb189723461aadc91dc6527301e1dbe/example_v2/stable-diffusion/ldm/models/diffusion/dpm_solver/sampler.py
@@ -43,12 +44,13 @@ class DPMSolverSampler(object):
         self.max_val=max_val
         self.threshold_pct=threshold_pct
         to_torch = lambda x: x.detach().clone().float().to(model.device)
-        self.register_buffer('alphas_cumprod', to_torch(model.alphas_cumprod))
+        preferred_device = torch.device(get_device_type())
+        self.register_buffer('alphas_cumprod', to_torch(model.alphas_cumprod), preferred_device)
 
-    def register_buffer(self, name, attr):
+    def register_buffer(self, name, attr, preferred_device: torch.device):
         if type(attr) == torch.Tensor:
-            if attr.device != torch.device("cuda"):
-                attr = attr.to(torch.device("cuda"))
+            if attr.device.type != preferred_device.type:
+                attr = attr.to(preferred_device)
         setattr(self, name, attr)
 
     @torch.no_grad()
