@@ -177,6 +177,67 @@ K_DIFF_SAMPLERS = { *KARRAS_SAMPLERS, *PRE_KARRAS_K_DIFF_SAMPLERS, *DPM_SOLVER_S
 NOT_K_DIFF_SAMPLERS = { 'ddim', 'plms' }
 VALID_SAMPLERS = { *K_DIFF_SAMPLERS, *NOT_K_DIFF_SAMPLERS }
 
+# class KCFGDenoiser(BaseModelWrapper):
+#     def forward(
+#         self,
+#         x: Tensor,
+#         sigma: Tensor,
+#         uncond: Tensor,
+#         cond: Tensor, 
+#         cond_scale: float,
+#         cond_arities: Iterable[int],
+#         cond_weights: Optional[Iterable[float]]
+#     ) -> Tensor:
+#         if uncond is None or cond_scale == 1.0:
+#             assert cond is None or cond.size(dim=0) == 1, "multi-cond guidance only implemented when CFG is in-use; please pass in an uncond, or use no more than 1 cond"
+#             return self.inner_model(x, sigma, cond=cond)
+#         uncond_count = uncond.size(dim=0)
+#         cond_count = cond.size(dim=0)
+#         cond_in = torch.cat((uncond, cond))
+#         del uncond, cond
+#         cond_arities_tensor = torch.tensor(cond_arities, device=cond_in.device)
+#         x_in = cat_self_with_repeat_interleaved(t=x, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
+#         del x
+#         sigma_in = cat_self_with_repeat_interleaved(t=sigma, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
+#         del sigma
+#         uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in).split([uncond_count, cond_count])
+#         del x_in, sigma_in, cond_in
+#         unconds = repeat_interleave_along_dim_0(t=uncond_out, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
+#         del cond_arities_tensor
+#         # transform
+#         #   tensor([0.5, 0.1])
+#         # into:
+#         #   tensor([[[[0.5000]]],
+#         #           [[[0.1000]]]])
+#         weight_tensor = (torch.tensor(cond_weights, device=uncond_out.device, dtype=unconds.dtype) * cond_scale).reshape(len(cond_weights), 1, 1, 1)
+#         deltas: Tensor = (conds_out-unconds) * weight_tensor
+#         del conds_out, unconds, weight_tensor
+#         cond = sum_along_slices_of_dim_0(deltas, arities=cond_arities)
+#         del deltas
+#         return uncond_out + cond
+
+# class KCFGDenoiser(BaseModelWrapper):
+#     def forward(
+#         self,
+#         x: Tensor,
+#         sigma: Tensor,
+#         uncond: Tensor,
+#         cond: Tensor, 
+#         cond_scale: float,
+#         # cond_arities: Iterable[int],
+#         # cond_weights: Optional[Iterable[float]]
+#         **kwargs,
+#     ) -> Tensor:
+#         if uncond is None or cond_scale == 1.0:
+#             return self.inner_model(x, sigma, cond=cond)
+#         cond_in = torch.cat([uncond, cond])
+#         del uncond, cond
+#         x_in = x.expand(cond_in.size(dim=0), -1, -1, -1)
+#         del x
+#         uncond, cond = self.inner_model(x_in, sigma, cond=cond_in).chunk(cond_in.size(dim=0))
+#         del x_in, cond_in
+#         return uncond + (cond - uncond) * cond_scale
+
 class KCFGDenoiser(BaseModelWrapper):
     def forward(
         self,
@@ -185,36 +246,15 @@ class KCFGDenoiser(BaseModelWrapper):
         uncond: Tensor,
         cond: Tensor, 
         cond_scale: float,
-        cond_arities: Iterable[int],
-        cond_weights: Optional[Iterable[float]]
+        # cond_arities: Iterable[int],
+        # cond_weights: Optional[Iterable[float]]
+        **kwargs,
     ) -> Tensor:
         if uncond is None or cond_scale == 1.0:
-            assert cond is None or cond.size(dim=0) == 1, "multi-cond guidance only implemented when CFG is in-use; please pass in an uncond, or use no more than 1 cond"
             return self.inner_model(x, sigma, cond=cond)
-        uncond_count = uncond.size(dim=0)
-        cond_count = cond.size(dim=0)
-        cond_in = torch.cat((uncond, cond))
-        del uncond, cond
-        cond_arities_tensor = torch.tensor(cond_arities, device=cond_in.device)
-        x_in = cat_self_with_repeat_interleaved(t=x, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
-        del x
-        sigma_in = cat_self_with_repeat_interleaved(t=sigma, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
-        del sigma
-        uncond_out, conds_out = self.inner_model(x_in, sigma_in, cond=cond_in).split([uncond_count, cond_count])
-        del x_in, sigma_in, cond_in
-        unconds = repeat_interleave_along_dim_0(t=uncond_out, factors_tensor=cond_arities_tensor, factors=cond_arities, output_size=cond_count)
-        del cond_arities_tensor
-        # transform
-        #   tensor([0.5, 0.1])
-        # into:
-        #   tensor([[[[0.5000]]],
-        #           [[[0.1000]]]])
-        weight_tensor = (torch.tensor(cond_weights, device=uncond_out.device, dtype=unconds.dtype) * cond_scale).reshape(len(cond_weights), 1, 1, 1)
-        deltas: Tensor = (conds_out-unconds) * weight_tensor
-        del conds_out, unconds, weight_tensor
-        cond = sum_along_slices_of_dim_0(deltas, arities=cond_arities)
-        del deltas
-        return uncond_out + cond
+        uncond = self.inner_model(x, sigma, cond=uncond)
+        cond = self.inner_model(x, sigma, cond=cond)
+        return uncond + (cond - uncond) * cond_scale
 
 # from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 # from transformers import AutoFeatureExtractor
